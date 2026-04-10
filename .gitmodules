@@ -1,0 +1,3 @@
+[submodule "wince_decompr"]
+	path = wince_decompr
+	url = git@github.com:KodaSec/wince-decompr.git

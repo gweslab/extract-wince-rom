@@ -1,0 +1,6 @@
+*
+!.gitignore
+!.gitmodules
+!extract_wince_rom.py
+!README.md
+!wince_decompr
