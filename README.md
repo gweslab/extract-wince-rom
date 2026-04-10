@@ -1,8 +1,8 @@
 # extract-wince-rom
 
-Extracts Windows CE ROM images (.BIN) into usable files: reconstructed PE executables, media, registry, and directory structure.
+Extracts Windows CE ROM images (.BIN, .nb0) into usable files: reconstructed PE executables, media, registry, and directory structure.
 
-Targets Microsoft Device Emulator images (WM5 / WM6 / WM6.5 / WM6.5.3).
+Targets Microsoft Device Emulator images and OEM dumps (WM5 / WM6 / WM6.5 / WM6.5.3).
 
 ## Features
 
@@ -17,10 +17,10 @@ Targets Microsoft Device Emulator images (WM5 / WM6 / WM6.5 / WM6.5.3).
 ## Usage
 
 ```
-python extract_wince_rom.py <image.BIN> [image2.BIN ...]
+python extract_wince_rom.py <image.BIN|.nb0> [image2.BIN ...]
 ```
 
-Or place `.BIN` files next to the script and run without arguments.
+Or place `.BIN`/`.nb0` files next to the script and run without arguments.
 
 Output goes to a directory named after the image (e.g. `WM5_PPC_USA/`).
 

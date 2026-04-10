@@ -543,14 +543,173 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     # Step 2: Unified scan for ALL absolute references within PE image range
     # Covers: patched realaddr refs, vtable entries, function pointers, literal pools
     size_of_image = _align(max(s['rva'] + s['vsize'] for s in sections), SA)
+
+    # Build exclude ranges for low-base modules where RVAs collide with image VAs.
+    # High-base modules (vbase >= size_of_image) can't have RVA/VA collisions.
+    exclude = []
+    if vbase < size_of_image:
+        def _sec_data_at(rva):
+            for s in sections:
+                if s['data'] and s['rva'] <= rva < s['rva'] + len(s['data']):
+                    return s['data'], rva - s['rva']
+            return None, 0
+
+        # Export directory (DD[0]): exclude 40-byte header + name tables, NOT function table
+        exp_rva, exp_sz = ce_dds[0] if len(ce_dds) > 0 else (0, 0)
+        if exp_rva and exp_sz:
+            exclude.append((exp_rva, exp_rva + 40))  # IMAGE_EXPORT_DIRECTORY header
+            d, off = _sec_data_at(exp_rva)
+            if d and off + 40 <= len(d):
+                num_funcs = struct.unpack_from('<I', d, off + 20)[0]
+                names_rva = struct.unpack_from('<I', d, off + 32)[0]
+                ords_rva = struct.unpack_from('<I', d, off + 36)[0]
+                num_names = struct.unpack_from('<I', d, off + 24)[0]
+                if names_rva:
+                    exclude.append((names_rva, names_rva + num_names * 4))
+                if ords_rva:
+                    exclude.append((ords_rva, ords_rva + num_names * 2))
+
+        # Import directory (DD[1]): exclude descriptor array + ILT regions
+        imp_rva, imp_sz = ce_dds[1] if len(ce_dds) > 1 else (0, 0)
+        if imp_rva and imp_sz:
+            exclude.append((imp_rva, imp_rva + imp_sz))
+            d, off = _sec_data_at(imp_rva)
+            if d:
+                pos = off
+                while pos + 20 <= len(d):
+                    ilt_rva = struct.unpack_from('<I', d, pos)[0]
+                    iat_rva = struct.unpack_from('<I', d, pos + 16)[0]
+                    if ilt_rva == 0 and iat_rva == 0:
+                        break
+                    if ilt_rva:
+                        d2, off2 = _sec_data_at(ilt_rva)
+                        if d2:
+                            end2 = off2
+                            while end2 + 4 <= len(d2):
+                                if struct.unpack_from('<I', d2, end2)[0] == 0:
+                                    end2 += 4; break
+                                end2 += 4
+                            exclude.append((ilt_rva, ilt_rva + (end2 - off2)))
+                    pos += 20
+
+        # Resource (DD[2]), Exception/pdata (DD[3]), Debug (DD[6]): all RVA-based
+        for dd_i in (2, 3, 6):
+            if dd_i < len(ce_dds):
+                dd_rva, dd_sz = ce_dds[dd_i]
+                if dd_rva and dd_sz:
+                    exclude.append((dd_rva, dd_rva + dd_sz))
+
+        # IAT (CE DD[7] → PE DD[12]): ordinal hints after IAT fix
+        if len(ce_dds) > 7:
+            iat_rva, iat_sz = ce_dds[7]
+            if iat_rva and iat_sz:
+                exclude.append((iat_rva, iat_rva + iat_sz))
+
+    def _in_exclude(rva):
+        for start, end in exclude:
+            if start <= rva < end:
+                return True
+        return False
+
+    def _find_literal_pool_offsets(text_data):
+        """Scan .text for ARM/Thumb LDR [PC, #offset] instructions and return
+        the set of literal pool data offsets (byte offsets within text_data)."""
+        pool = set()
+        sz = len(text_data)
+        # ARM mode: 4-byte aligned LDR Rd, [PC, #offset]
+        for i in range(0, sz - 3, 4):
+            instr = struct.unpack_from('<I', text_data, i)[0]
+            if (instr & 0x0F7F0000) == 0x051F0000:
+                off12 = instr & 0xFFF
+                addr = i + 8 + off12 if (instr >> 23) & 1 else i + 8 - off12
+                if 0 <= addr <= sz - 4 and (addr & 3) == 0:
+                    pool.add(addr)
+        # Thumb mode: 2-byte aligned
+        for i in range(0, sz - 1, 2):
+            hw = struct.unpack_from('<H', text_data, i)[0]
+            # Thumb 16-bit: LDR Rd, [PC, #imm8*4]
+            if (hw & 0xF800) == 0x4800:
+                addr = ((i + 4) & ~3) + (hw & 0xFF) * 4
+                if 0 <= addr <= sz - 4 and (addr & 3) == 0:
+                    pool.add(addr)
+            # Thumb-2 32-bit: LDR.W Rd, [PC, #imm12]
+            elif (hw & 0xFF7F) == 0xF85F and i + 3 < sz:
+                hw2 = struct.unpack_from('<H', text_data, i + 2)[0]
+                off12 = hw2 & 0xFFF
+                base = (i + 4) & ~3
+                addr = base + off12 if (hw >> 7) & 1 else base - off12
+                if 0 <= addr <= sz - 4 and (addr & 3) == 0:
+                    pool.add(addr)
+        return pool
+
+    def _get_code_ranges(pdata_rva, pdata_sz, text_rva, text_vsize):
+        """Parse .pdata to get sorted (start, end) code ranges within .text."""
+        ranges = []
+        for sec in sections:
+            if sec['data'] and sec['rva'] <= pdata_rva < sec['rva'] + len(sec['data']):
+                base = pdata_rva - sec['rva']
+                for i in range(pdata_sz // 8):
+                    eo = base + i * 8
+                    if eo + 8 > len(sec['data']):
+                        break
+                    begin_rva = struct.unpack_from('<I', sec['data'], eo)[0]
+                    flags = struct.unpack_from('<I', sec['data'], eo + 4)[0]
+                    func_len = (flags >> 8) & 0x3FFFFF
+                    insn_sz = 4 if (flags >> 30) & 1 else 2
+                    fs = begin_rva - vbase - text_rva
+                    fe = fs + func_len * insn_sz
+                    if 0 <= fs < text_vsize:
+                        ranges.append((fs, min(fe, text_vsize)))
+                break
+        ranges.sort()
+        return ranges
+
+    def _is_in_code(off, code_ranges):
+        lo, hi = 0, len(code_ranges) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            s, e = code_ranges[mid]
+            if off < s:
+                hi = mid - 1
+            elif off >= e:
+                lo = mid + 1
+            else:
+                return True
+        return False
+
+    # .pdata (CE DD[3])
+    pdata_rva, pdata_sz = ce_dds[3] if len(ce_dds) > 3 else (0, 0)
+
     reloc_rvas = []
     for sec in sections:
         if not sec['data'] or sec['name'].startswith(b'.reloc'):
             continue
-        for off in range(0, len(sec['data']) - 3, 4):
-            val = struct.unpack_from('<I', sec['data'], off)[0]
-            if vbase <= val < vbase + size_of_image:
-                reloc_rvas.append(sec['rva'] + off)
+        if sec['flags'] & 0x20:
+            # Code section: LDR pools (within functions) + pdata gaps (between functions)
+            ldr_offsets = _find_literal_pool_offsets(sec['data'])
+            pdata_offsets = set()
+            if pdata_rva and pdata_sz:
+                code_ranges = _get_code_ranges(pdata_rva, pdata_sz, sec['rva'], sec['vsize'])
+                if code_ranges:
+                    for off in range(0, len(sec['data']) - 3, 4):
+                        if not _is_in_code(off, code_ranges):
+                            val = struct.unpack_from('<I', sec['data'], off)[0]
+                            if vbase <= val < vbase + size_of_image:
+                                pdata_offsets.add(off)
+            for off in sorted(ldr_offsets | pdata_offsets):
+                val = struct.unpack_from('<I', sec['data'], off)[0]
+                if vbase <= val < vbase + size_of_image:
+                    abs_rva = sec['rva'] + off
+                    if not _in_exclude(abs_rva):
+                        reloc_rvas.append(abs_rva)
+        else:
+            # Data sections: scan all 4-byte aligned values
+            for off in range(0, len(sec['data']) - 3, 4):
+                val = struct.unpack_from('<I', sec['data'], off)[0]
+                if vbase <= val < vbase + size_of_image:
+                    abs_rva = sec['rva'] + off
+                    if not _in_exclude(abs_rva):
+                        reloc_rvas.append(abs_rva)
 
     # Step 3: Build PE .reloc section from all discovered relocations
     if reloc_rvas:
@@ -1378,16 +1537,16 @@ def main():
     if len(sys.argv) > 1:
         paths = sys.argv[1:]
     else:
-        # Auto-detect .BIN files in current directory
+        # Auto-detect .BIN and .nb0 files in current directory
         here = os.path.dirname(os.path.abspath(__file__))
         paths = sorted(
             os.path.join(here, f)
             for f in os.listdir(here)
-            if f.upper().endswith('.BIN') and os.path.isfile(os.path.join(here, f))
+            if f.upper().endswith(('.BIN', '.NB0')) and os.path.isfile(os.path.join(here, f))
         )
         if not paths:
-            print("Usage: python extract_wince_rom.py <image.BIN> [...]")
-            print("   or: place .BIN files next to this script")
+            print("Usage: python extract_wince_rom.py <image.BIN|.nb0> [...]")
+            print("   or: place .BIN/.nb0 files next to this script")
             sys.exit(1)
 
     for p in paths:
