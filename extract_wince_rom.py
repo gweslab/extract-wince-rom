@@ -543,6 +543,8 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     # Step 2: Unified scan for ALL absolute references within PE image range
     # Covers: patched realaddr refs, vtable entries, function pointers, literal pools
     size_of_image = _align(max(s['rva'] + s['vsize'] for s in sections), SA)
+    # Saturate image end at 32-bit boundary to prevent wrap-around for high-base modules
+    img_end = min(vbase + size_of_image, 0x100000000)
 
     # Build exclude ranges for low-base modules where RVAs collide with image VAs.
     # High-base modules (vbase >= size_of_image) can't have RVA/VA collisions.
@@ -680,6 +682,15 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     # .pdata (CE DD[3])
     pdata_rva, pdata_sz = ce_dds[3] if len(ce_dds) > 3 else (0, 0)
 
+    # Identify the resource section via IMAGE_DIRECTORY_ENTRY_RESOURCE (CE DD[2])
+    rsrc_rva, rsrc_sz = ce_dds[2] if len(ce_dds) > 2 else (0, 0)
+    def _is_rsrc_section(sec):
+        if rsrc_rva and rsrc_sz:
+            sec_end = sec['rva'] + max(sec['vsize'], len(sec['data']))
+            if sec['rva'] <= rsrc_rva < sec_end:
+                return True
+        return False
+
     reloc_rvas = []
     for sec in sections:
         if not sec['data'] or sec['name'].startswith(b'.reloc'):
@@ -694,19 +705,22 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
                     for off in range(0, len(sec['data']) - 3, 4):
                         if not _is_in_code(off, code_ranges):
                             val = struct.unpack_from('<I', sec['data'], off)[0]
-                            if vbase <= val < vbase + size_of_image:
+                            if vbase <= val < img_end:
                                 pdata_offsets.add(off)
             for off in sorted(ldr_offsets | pdata_offsets):
                 val = struct.unpack_from('<I', sec['data'], off)[0]
-                if vbase <= val < vbase + size_of_image:
+                if vbase <= val < img_end:
                     abs_rva = sec['rva'] + off
                     if not _in_exclude(abs_rva):
                         reloc_rvas.append(abs_rva)
         else:
+            # Skip resource section (identified by IMAGE_DIRECTORY_ENTRY_RESOURCE)
+            if _is_rsrc_section(sec):
+                continue
             # Data sections: scan all 4-byte aligned values
             for off in range(0, len(sec['data']) - 3, 4):
                 val = struct.unpack_from('<I', sec['data'], off)[0]
-                if vbase <= val < vbase + size_of_image:
+                if vbase <= val < img_end:
                     abs_rva = sec['rva'] + off
                     if not _in_exclude(abs_rva):
                         reloc_rvas.append(abs_rva)
