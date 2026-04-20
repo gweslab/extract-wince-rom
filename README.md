@@ -4,6 +4,9 @@ Extracts Windows CE ROM images (.BIN, .nb0) into usable files: reconstructed PE 
 
 Targets Microsoft Device Emulator images and OEM dumps (WM5 / WM6 / WM6.5 / WM6.5.3).
 
+> [!WARNING]
+> None of what this extractor does is proven correct. The de-baking process — in particular `.reloc` synthesis — has already shipped with several bugs that silently produced invalid PE images (e.g. relocations targeting `.rsrc` corrupting dialog templates, stripped `.rdata` relocations breaking C++ vtables). All other stages (XIP reconstruction, IAT repair, IMGFS extraction, registry conversion) are likewise heuristic and have not been independently verified against a reference implementation. Treat all output as best-effort; more bugs are almost certainly present.
+
 ## Features
 
 - **B000FF** (sectioned container) and **NB0** (flat binary) ROM formats
