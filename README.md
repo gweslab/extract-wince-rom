@@ -2,7 +2,7 @@
 
 Extracts Windows CE ROM images (.BIN, .nb0) into usable files: reconstructed PE executables, media, registry, and directory structure.
 
-Targets Microsoft Device Emulator images and OEM dumps (WM5 / WM6 / WM6.5 / WM6.5.3).
+Targets Microsoft Device Emulator images and OEM dumps (WM2003SE / WM5 / WM6 / WM6.5 / WM6.5.3).
 
 > [!WARNING]
 > **`.reloc` synthesis is inherently approximate.** The ROM builder strips the original base-relocation directory (XIP modules don't need it at load time), so there is no ground truth — entries are reconstructed by scanning section bytes for 4-byte values that fall within the module's image range. ARM instruction encodings, resource sentinels, and coincidental in-range values all collide with real pointers, and every `.reloc` bug shipped so far has come from this pass. Expect more.
@@ -16,8 +16,8 @@ Targets Microsoft Device Emulator images and OEM dumps (WM5 / WM6 / WM6.5 / WM6.
 - **IMGFS filesystem** extraction with Flash Translation Layer page mapping and XPRESS decompression
 - **Relocation fixup** for XIP PEs: patches split-address references (`o32_realaddr`) and generates `.reloc` sections covering all absolute references within each module's image range
 - **Import table repair**: overwrites ROM-baked IAT entries with original ILT ordinal/name hints
-- **Directory structure** from `initflashfiles.dat`
-- **Registry** extraction (`.rgu` to UTF-8 `.reg` conversion)
+- **Directory structure** from `initflashfiles.dat` (WM5+) or `initobj.dat` (WM2003)
+- **Registry** extraction: `.rgu` → UTF-8 `.reg` (WM5+) and `default.fdf` binary boot registry → `.reg` (WM2003)
 
 ## Usage
 
@@ -33,6 +33,7 @@ Output goes to a directory named after the image (e.g. `WM5_PPC_USA/`).
 
 | Image | Format |
 |-------|--------|
+| `WM2003SE.bin` | B000FF |
 | `WM5_PPC_USA.BIN` | B000FF |
 | `WM6_PPC_USA_GSM_VR.BIN` | NB0 |
 | `WM65_PPC_USA_GSM_VR.BIN` | NB0 |
