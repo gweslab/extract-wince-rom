@@ -69,8 +69,10 @@ def parse_fdf_registry(raw):
             path_end = body_off + 4 + pchars * 2
             if path_end > body_end:
                 break
+            # WM2003 stores trailing NUL inside pchars; CE3 stores leading NUL.
+            # Strip both ends so the same parser handles both layouts.
             path = raw[body_off + 4:path_end].decode(
-                'utf-16-le', errors='replace').rstrip('\x00')
+                'utf-16-le', errors='replace').strip('\x00')
             records.append(('KEY', path))
         elif rtype == 2:
             if size < 6:
@@ -83,7 +85,7 @@ def parse_fdf_registry(raw):
             if data_end > body_end:
                 break
             name = raw[body_off + 6:name_end].decode(
-                'utf-16-le', errors='replace').rstrip('\x00')
+                'utf-16-le', errors='replace').strip('\x00')
             data = bytes(raw[name_end:data_end])
             records.append(('VALUE', name, vtype, data))
         else:
