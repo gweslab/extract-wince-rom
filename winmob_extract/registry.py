@@ -1,11 +1,13 @@
-"""WM2003 binary boot registry parser (default.fdf -> Windows REGEDIT4 .reg).
+"""CE binary boot registry parser (default.fdf -> Windows REGEDIT4 .reg).
 
-Format determined empirically from WM2003SE default.fdf (310,827 bytes parsed
-exactly to byte boundary). No external spec used.
+Used by Pocket PC 2000 (CE 3) and Windows Mobile 2003 (CE 4.x). Both share
+the same binary registry format. Determined empirically from WM2003SE
+default.fdf (310,827 bytes) and IPAQROM177 default.fdf (177,749 bytes),
+both parsed exactly to byte boundary. No external spec used.
 
-  Header:
-    6 bytes : magic 'B274831D2BBE'
-    u16     : version (= 0x0004 in observed sample)
+  Header (8 bytes total):
+    4 bytes : magic 'B274831D'
+    u32     : file size (matches len(raw) exactly)
 
   Records flow until EOF. Each record:
     u16  : payload_size (bytes following the type word)
@@ -32,7 +34,7 @@ A value name of "Default" maps to the registry's default (unnamed) value
 from .util import u16, u32
 
 
-WM2003_REG_MAGIC = b'\xB2\x74\x83\x1D\x2B\xBE'
+CE_FDF_MAGIC = b'\xB2\x74\x83\x1D'
 
 
 def _reg_escape(s):
@@ -43,16 +45,16 @@ def _reg_hex_bytes(data):
     return ','.join(f'{b:02x}' for b in data)
 
 
-def parse_wm2003_fdf(raw):
-    """Parse WM2003 default.fdf binary registry.
+def parse_fdf_registry(raw):
+    """Parse a CE / WM2003 default.fdf binary boot registry.
 
     Returns a list of records as ('KEY', path) / ('VALUE', name, value_type, data).
     Returns None if the magic does not match.
     """
-    if len(raw) < 8 or raw[:6] != WM2003_REG_MAGIC:
+    if len(raw) < 8 or raw[:4] != CE_FDF_MAGIC:
         return None
     records = []
-    off = 8  # skip magic + version
+    off = 8  # skip 4-byte magic + 4-byte file-size DWORD
     while off + 4 <= len(raw):
         size = u16(raw, off)
         rtype = u16(raw, off + 2)
@@ -91,7 +93,7 @@ def parse_wm2003_fdf(raw):
     return records
 
 
-def wm2003_fdf_to_reg_text(records):
+def fdf_to_reg_text(records):
     """Convert parsed default.fdf records to Windows REGEDIT4 text format."""
     lines = ['REGEDIT4', '']
     for rec in records:

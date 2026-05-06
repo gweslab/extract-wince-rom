@@ -83,15 +83,26 @@ def extract_xip_regions(data, base_offset, output_dir, label=""):
             xip_base = max(ecec_off - 0x40, 0)
             romhdr_off = xip_base + romhdr_phys
             load_offset = romhdr_va - romhdr_off
+            candidates = [(romhdr_off, load_offset)]
         else:
-            # WM2003-style: romhdr_phys=0, romhdr is at the VA given by romhdr_va
-            romhdr_off = romhdr_va - base_offset
-            load_offset = base_offset
+            # romhdr_phys=0: ROMHDR is reachable only via VA. Try the explicit
+            # base_offset first (WM2003 B000FF), then derive a load base from
+            # romhdr_va's high bits (NB0 PocketPC 2000, where the file is just
+            # the raw ROM mapped at e.g. 0x80000000 with no section header).
+            candidates = [(romhdr_va - base_offset, base_offset)]
+            for mask in (0xFF000000, 0xF0000000):
+                cand_load = romhdr_va & mask
+                cand_off = romhdr_va - cand_load
+                if (cand_off, cand_load) not in candidates:
+                    candidates.append((cand_off, cand_load))
 
-        if romhdr_off < 0 or romhdr_off + ROMHDR_SIZE > len(data):
-            continue
-
-        hdr = parse_romhdr(data, romhdr_off)
+        hdr = None
+        for romhdr_off, load_offset in candidates:
+            if 0 <= romhdr_off and romhdr_off + ROMHDR_SIZE <= len(data):
+                h = parse_romhdr(data, romhdr_off)
+                if h is not None:
+                    hdr = h
+                    break
         if hdr is None:
             continue
 

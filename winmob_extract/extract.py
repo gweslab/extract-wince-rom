@@ -14,8 +14,7 @@ from .util import u32
 from .b000ff import parse_b000ff
 from .xip import extract_xip_regions
 from .imgfs import IMGFS_UUID, IMGFS_DIRENT_SIZE, find_imgfs_base, extract_imgfs
-from .registry import (WM2003_REG_MAGIC, parse_wm2003_fdf,
-                       wm2003_fdf_to_reg_text)
+from .registry import CE_FDF_MAGIC, parse_fdf_registry, fdf_to_reg_text
 
 
 # ── Directory structure (initflashfiles.dat / initobj.dat) ──────────────────
@@ -28,7 +27,7 @@ def _decode_hex_name(s):
 
 def _post_process_fs(out_dir, win_dir):
     """Rebuild directory tree from initflashfiles.dat (WM5+) or
-    initobj.dat (WM2003). Same syntax in both."""
+    initobj.dat (CE3 / WM2003). Same syntax in all of them."""
     iff_path = None
     iff_source = None
     for candidate in ("initflashfiles.dat", "initobj.dat"):
@@ -121,24 +120,24 @@ def _convert_rgu_to_reg(src, dst):
 def _post_process_registry(out_dir, win_dir):
     """Convert registry blobs from <out>/Windows/ into <out>/Registry/.
 
-    WM5+ : .rgu (UTF-16 text) -> UTF-8 .reg
-           .hv  (binary hive) -> copied verbatim
-    WM2003: default.fdf (binary boot registry) -> UTF-8 .reg
+    WM5+        : .rgu (UTF-16 text) -> UTF-8 .reg
+                  .hv  (binary hive) -> copied verbatim
+    CE3 / WM2003: default.fdf (binary boot registry) -> UTF-8 .reg
     """
     rgu_files = sorted(f for f in os.listdir(win_dir)
                        if f.lower().endswith('.rgu'))
     hv_files = [f for f in os.listdir(win_dir)
                 if f.lower().endswith('.hv')]
-    wm2003_fdf = []
+    fdf_files = []
     for cand in ("default.fdf",):
         p = os.path.join(win_dir, cand)
         if os.path.isfile(p):
             with open(p, 'rb') as f:
-                head = f.read(len(WM2003_REG_MAGIC))
-            if head == WM2003_REG_MAGIC:
-                wm2003_fdf.append(cand)
+                head = f.read(len(CE_FDF_MAGIC))
+            if head == CE_FDF_MAGIC:
+                fdf_files.append(cand)
 
-    if not (rgu_files or hv_files or wm2003_fdf):
+    if not (rgu_files or hv_files or fdf_files):
         return
 
     reg_dir = os.path.join(out_dir, "Registry")
@@ -153,18 +152,18 @@ def _post_process_registry(out_dir, win_dir):
     for hv in hv_files:
         shutil.copy2(os.path.join(win_dir, hv), os.path.join(reg_dir, hv))
 
-    wm2003_converted = 0
-    for fn in wm2003_fdf:
+    fdf_converted = 0
+    for fn in fdf_files:
         src = os.path.join(win_dir, fn)
         with open(src, 'rb') as f:
             raw = f.read()
-        records = parse_wm2003_fdf(raw)
+        records = parse_fdf_registry(raw)
         if records:
-            text = wm2003_fdf_to_reg_text(records)
+            text = fdf_to_reg_text(records)
             dst = os.path.join(reg_dir, os.path.splitext(fn)[0] + '.reg')
             with open(dst, 'w', encoding='utf-8') as f:
                 f.write(text)
-            wm2003_converted += 1
+            fdf_converted += 1
         else:
             shutil.copy2(src, os.path.join(reg_dir, fn))
 
@@ -172,8 +171,8 @@ def _post_process_registry(out_dir, win_dir):
         print(f"  {len(rgu_files)} .reg files -> {reg_dir} (UTF-8)")
     if hv_files:
         print(f"  {len(hv_files)} .hv hive files -> {reg_dir}")
-    if wm2003_converted:
-        print(f"  {wm2003_converted} WM2003 boot registry converted "
+    if fdf_converted:
+        print(f"  {fdf_converted} boot registry (.fdf) converted "
               f"to .reg -> {reg_dir}")
 
 
@@ -197,7 +196,7 @@ def extract_image(bin_path):
     is_b000ff = data[:7] == b'B000FF\n'
 
     if is_b000ff:
-        # B000FF container (WM2003, WM5)
+        # B000FF container (WM2003 / WM5)
         print("\nFormat: B000FF (section container)")
         flat, base_va = parse_b000ff(data)
         if flat is None:

@@ -2,8 +2,8 @@
 
 The e32_rom struct has two known variants in CE / Windows Mobile ROMs:
 
-  - WM2003-style ('legacy'): data directory array starts at 0x20.
-  - WM5+-style:               an extra 4-byte field of unverified meaning sits
+  - 'legacy' (CE3 / WM2003): data directory array starts at 0x20.
+  - WM5+-style              : an extra 4-byte field of unverified meaning sits
                               at 0x20 (preserved verbatim and emitted as the
                               output PE's COFF TimeDateStamp), pushing the DD
                               array to 0x24.
@@ -15,7 +15,7 @@ picking the one whose DDs and subsystem look semantically valid.
 from ..util import u16, u32
 
 
-E32_DD_OFF_LEGACY = 0x20  # WM2003-style
+E32_DD_OFF_LEGACY = 0x20  # CE3 / WM2003
 E32_DD_OFF_WM5    = 0x24  # WM5+-style
 O32_SIZE = 24             # sizeof(o32_rom)
 
@@ -32,11 +32,11 @@ def parse_e32_base(data, off, dd_offset):
     sub_min   = u16(data, off + 0x0E)
     stackmax  = u32(data, off + 0x10)
     vsize     = u32(data, off + 0x14)
-    # WM5+ e32rom has a 4-byte field at offset 0x20 that the WM2003-style layout
-    # lacks (in the legacy layout, DD[0] sits there instead). Empirically the
-    # value is sometimes a Unix timestamp matching the build date, but more often
-    # is unrecognizable (likely a compiler-generated hash). Semantic meaning is
-    # unverified; preserved verbatim and emitted into the output COFF TimeDateStamp.
+    # WM5+ e32rom has a 4-byte field at offset 0x20 that the CE3/WM2003 (legacy)
+    # layout lacks (in the legacy layout, DD[0] sits there instead). Empirically
+    # the value is sometimes a Unix timestamp matching the build date, but more
+    # often is unrecognizable (likely a compiler-generated hash). Semantic meaning
+    # is unverified; preserved verbatim and emitted into the output COFF TimeDateStamp.
     ts = u32(data, off + 0x20) if dd_offset == E32_DD_OFF_WM5 else 0
 
     ce_dds = []
@@ -59,7 +59,7 @@ def parse_e32_base(data, off, dd_offset):
 
 def _layout_valid(info):
     """Heuristic: does this parse look semantically right? Catches DD offset
-    mismatches between WM2003-style (legacy) and WM5+-style layouts."""
+    mismatches between CE3/WM2003 (legacy) and WM5+-style layouts."""
     if info is None:
         return False
     if info['subsystem'] not in (1, 2, 3, 7, 9, 10, 11):

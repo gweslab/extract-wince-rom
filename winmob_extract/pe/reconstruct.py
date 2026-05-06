@@ -117,8 +117,8 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
                        dd_offset=None):
     """Build PE from XIP module (separate e32/o32 pointers in flat image).
 
-    Auto-detects e32rom layout (legacy/WM2003 vs WM5+) unless dd_offset is
-    explicitly given.
+    Auto-detects e32rom layout (legacy CE3/WM2003 vs WM5+) unless dd_offset
+    is explicitly given.
     """
     e32 = e32_va - base_off
     o32 = o32_va - base_off

@@ -118,8 +118,99 @@ def _lz77_core(src, out_size, nibble_sharing):
     return bytes(dst[:di]) if di < out_size else bytes(dst)
 
 
+def _ce3_bin_decompress_block(src, dst_max):
+    """One inner block of the CE3 BIN compression scheme.
+
+    Block format:
+      flag byte: 8 tokens, LSB-first; bit 0 = literal, bit 1 = match.
+      Literal: read 1 byte, write to output.
+      Match: read 1 byte t. low = t & 0xF, high = (t >> 4) & 0xF.
+        low == 1 -> short match: length=2, src_pos = di - high - 2.
+        low == 0 -> long match : read b1, src_pos = (b1 << 4) | high
+                                 (12-bit absolute output offset within block);
+                                 read b2, length = b2 + 17.
+        low >  1 -> medium match: read b1, src_pos = (b1 << 4) | high;
+                                  length = low + 1 (3..16).
+      Copy is byte-by-byte from absolute output position (RLE-safe overlap).
+    """
+    out = bytearray(dst_max)
+    si = 0
+    di = 0
+    slen = len(src)
+    while si < slen and di < dst_max:
+        flag = src[si]; si += 1
+        for bit in range(8):
+            if si >= slen or di >= dst_max:
+                break
+            t = src[si]; si += 1
+            if not (flag & (1 << bit)):
+                out[di] = t
+                di += 1
+            else:
+                low = t & 0xF
+                high = (t >> 4) & 0xF
+                if low == 1:
+                    length = 2
+                    src_pos = di - high - 2
+                else:
+                    if si >= slen:
+                        return bytes(out[:di])
+                    b = src[si]; si += 1
+                    src_pos = (b << 4) | high
+                    if low == 0:
+                        if si >= slen:
+                            return bytes(out[:di])
+                        length = src[si] + 17; si += 1
+                    else:
+                        length = low + 1
+                for k in range(length):
+                    if di >= dst_max:
+                        break
+                    out[di] = out[src_pos + k]
+                    di += 1
+    return bytes(out[:di])
+
+
+def ce3_bin_decompress(src, out_size, block_bits=12):
+    """Decompress a CE3 / Pocket PC 2000 BIN-compressed payload.
+
+    Returns the decompressed bytes (zero-padded to out_size) or None if the
+    input doesn't look like a valid CE3 multi-block stream. Outer wrapper:
+    3-byte little-endian uncompressed-size header, then num_blocks-1 more
+    3-byte block-end offsets, then concatenated independent blocks of up to
+    (1 << block_bits) bytes each.
+    """
+    if len(src) < 3:
+        return None
+    uncomp_size = src[0] | (src[1] << 8) | (src[2] << 16)
+    num_blocks = (uncomp_size >> block_bits) + 2
+    if len(src) < 3 * num_blocks:
+        return None
+    block_size = 1 << block_bits
+    out = bytearray()
+    prev_end = 3 * num_blocks
+    for i in range(1, num_blocks):
+        end = src[i*3] | (src[i*3+1] << 8) | (src[i*3+2] << 16)
+        if end > len(src) or end < prev_end:
+            return None
+        block_data = src[prev_end:end]
+        remaining = uncomp_size - len(out)
+        block_out = _ce3_bin_decompress_block(block_data, min(remaining, block_size))
+        out.extend(block_out)
+        prev_end = end
+    if len(out) < out_size:
+        out.extend(b'\x00' * (out_size - len(out)))
+    return bytes(out[:out_size])
+
+
 def ce_rom_decompress(src, out_size):
-    """Decompress a CE ROM compressed section using LZX (BinDecompressROM)."""
+    """Decompress a CE ROM compressed section.
+
+    Tries LZX first (CE 4+ ROMs). Falls back to the CE3 BIN scheme for older
+    Pocket PC 2000 / CE 3 ROMs. Returns `out_size` bytes always (zero-padded
+    on partial decompression or total failure) so callers don't need to
+    handle short reads.
+    """
     dcbuf = bytearray(out_size + 4096)
     try:
         rlen = _lzx_decompress_rom(bytes(src), len(src), dcbuf, out_size, 0, 1, 4096)
@@ -130,6 +221,9 @@ def ce_rom_decompress(src, out_size):
         if len(result) < out_size:
             result += b'\x00' * (out_size - len(result))
         return result
+    ce3 = ce3_bin_decompress(src, out_size)
+    if ce3 is not None:
+        return ce3
     return b'\x00' * out_size  # fallback: zero-fill on failure
 
 
