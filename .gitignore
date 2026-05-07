@@ -2,6 +2,7 @@
 !.gitignore
 !.gitmodules
 !extract_wince_rom.py
+!postprocess_sysgen.py
 !README.md
 !wince_decompr
 !winmob_extract

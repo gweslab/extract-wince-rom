@@ -157,6 +157,8 @@ def _post_process_registry(out_dir, win_dir):
         src = os.path.join(win_dir, rgu)
         dst = os.path.join(reg_dir, os.path.splitext(rgu)[0] + '.reg')
         _convert_rgu_to_reg(src, dst)
+        # Also preserve the original .rgu next to the converted .reg
+        shutil.copy2(src, os.path.join(reg_dir, rgu))
 
     for hv in hv_files:
         shutil.copy2(os.path.join(win_dir, hv), os.path.join(reg_dir, hv))
@@ -166,6 +168,8 @@ def _post_process_registry(out_dir, win_dir):
         src = os.path.join(win_dir, fn)
         with open(src, 'rb') as f:
             raw = f.read()
+        # Preserve the original .fdf next to the converted .reg
+        shutil.copy2(src, os.path.join(reg_dir, fn))
         records = parse_fdf_registry(raw)
         if records:
             text = fdf_to_reg_text(records)
@@ -173,8 +177,6 @@ def _post_process_registry(out_dir, win_dir):
             with open(dst, 'w', encoding='utf-8') as f:
                 f.write(text)
             fdf_converted += 1
-        else:
-            shutil.copy2(src, os.path.join(reg_dir, fn))
 
     if rgu_files:
         print(f"  {len(rgu_files)} .reg files -> {reg_dir} (UTF-8)")
