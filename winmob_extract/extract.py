@@ -198,10 +198,22 @@ def extract_image(bin_path):
     if is_b000ff:
         # B000FF container (WM2003 / WM5)
         print("\nFormat: B000FF (section container)")
-        flat, base_va = parse_b000ff(data)
+        flat, base_va, records = parse_b000ff(data)
         if flat is None:
             print("ERROR: Failed to parse B000FF container")
             return False
+
+        # Dump each section verbatim under <out>/Sections/. Lets the user
+        # recover bootloader/eboot images that have no ECEC marker, and gives
+        # ground truth for kernel ROMs alongside the PE-reconstructed output.
+        sec_dir = os.path.join(out_dir, "Sections")
+        os.makedirs(sec_dir, exist_ok=True)
+        for i, (sec_base, sec_size, file_off) in enumerate(records):
+            sec_path = os.path.join(
+                sec_dir, f"{i:02d}_0x{sec_base:08X}_{sec_size}.bin")
+            with open(sec_path, 'wb') as f:
+                f.write(data[file_off:file_off + sec_size])
+        print(f"  {len(records)} sections dumped -> {sec_dir}")
 
         print("\nExtracting XIP regions...")
         extract_xip_regions(flat, base_va, out_dir)
