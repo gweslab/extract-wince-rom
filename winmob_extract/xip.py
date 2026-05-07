@@ -58,7 +58,7 @@ def parse_romhdr(data, off):
     return hdr
 
 
-def extract_xip_regions(data, base_offset, output_dir, label=""):
+def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
     """Find and extract all XIP regions from a flat image.
 
     data:        flat image bytes
@@ -66,6 +66,9 @@ def extract_xip_regions(data, base_offset, output_dir, label=""):
                  (file_offset = VA - base_offset)
     output_dir:  root output directory
     label:       prefix for log messages
+    attr_log:    optional dict; if provided, records the original CE file
+                 attribute bits and FILETIME for every emitted module/file as
+                 attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
     """
     ecec_limit = min(len(data), 0x800000)  # ECEC should be in first 8 MB
     ececs = find_all_ecec(data, limit=ecec_limit)
@@ -143,6 +146,8 @@ def extract_xip_regions(data, base_offset, output_dir, label=""):
                 with open(outpath, 'wb') as f:
                     f.write(pe_data)
                 extracted_mods += 1
+                if attr_log is not None:
+                    attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
 
         # Extract files
         extracted_files = 0
@@ -170,6 +175,8 @@ def extract_xip_regions(data, base_offset, output_dir, label=""):
                 with open(outpath, 'wb') as f:
                     f.write(raw)
                 extracted_files += 1
+                if attr_log is not None:
+                    attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
 
         total_mods += extracted_mods
         total_files += extracted_files

@@ -25,9 +25,13 @@ def _decode_hex_name(s):
                   lambda m: chr(int(m.group(1), 16)), s)
 
 
-def _post_process_fs(out_dir, win_dir):
+def _post_process_fs(out_dir, win_dir, attr_log=None):
     """Rebuild directory tree from initflashfiles.dat (WM5+) or
-    initobj.dat (CE3 / WM2003). Same syntax in all of them."""
+    initobj.dat (CE3 / WM2003). Same syntax in all of them.
+
+    If attr_log is given (mapping '\\Windows\\<name>' -> (attrs, filetime)),
+    each placed file gets an additional entry under its placed CE path so
+    the emulator has attrs at every on-disk location."""
     iff_path = None
     iff_source = None
     for candidate in ("initflashfiles.dat", "initobj.dat"):
@@ -93,6 +97,11 @@ def _post_process_fs(out_dir, win_dir):
             if os.path.isfile(src_full) and not os.path.exists(dest_full):
                 shutil.copy2(src_full, dest_full)
                 files_placed += 1
+                if attr_log is not None:
+                    src_key = '\\Windows\\' + src_file
+                    if src_key in attr_log:
+                        placed_key = dest_dir.rstrip(chr(92)) + chr(92) + dest_name
+                        attr_log[placed_key] = attr_log[src_key]
 
     print(f"\nDirectory structure (from {iff_source}):")
     print(f"  {dirs_created} directories created")
@@ -176,6 +185,35 @@ def _post_process_registry(out_dir, win_dir):
               f"to .reg -> {reg_dir}")
 
 
+# ── Attribute map ───────────────────────────────────────────────────────────
+
+def _write_attribute_ini(out_dir, attr_log):
+    """Write the captured CE attribute map to <out>/attributes.ini.
+
+    Files extracted to disk lose their CE attribute bits (host FS gets the
+    Windows default `Archive` only). The emulator can re-apply the original
+    bits by reading this file at boot.
+    """
+    if not attr_log:
+        return
+    path = os.path.join(out_dir, 'attributes.ini')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("; CE filesystem attribute map.\n")
+        f.write(";\n")
+        f.write("; <ce_path> = <attrs_hex> <filetime_hex>\n")
+        f.write(";\n")
+        f.write("; bits: 0x01=RO  0x02=HIDDEN  0x04=SYSTEM  0x10=DIR\n")
+        f.write(";       0x20=ARCHIVE  0x40=INROM  0x80=NORMAL  0x100=TEMPORARY\n")
+        f.write(";       0x800=COMPRESSED\n")
+        f.write(";       0x40000000=ROMMODULE  0x80000000=ROMSTATICREF\n")
+        f.write("; filetime: 64-bit Windows FILETIME (100ns since 1601-01-01 UTC)\n")
+        f.write("\n[Files]\n")
+        for p in sorted(attr_log):
+            attrs, ft = attr_log[p]
+            f.write(f"{p} = 0x{attrs:08X} 0x{ft:016X}\n")
+    print(f"  attribute map ({len(attr_log)} entries) -> {path}")
+
+
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
 def extract_image(bin_path):
@@ -194,6 +232,7 @@ def extract_image(bin_path):
     os.makedirs(out_dir, exist_ok=True)
 
     is_b000ff = data[:7] == b'B000FF\n'
+    attr_log = {}  # CE-style path -> (attrs, filetime); written at the end
 
     if is_b000ff:
         # B000FF container (WM2003 / WM5)
@@ -216,7 +255,7 @@ def extract_image(bin_path):
         print(f"  {len(records)} sections dumped -> {sec_dir}")
 
         print("\nExtracting XIP regions...")
-        extract_xip_regions(flat, base_va, out_dir)
+        extract_xip_regions(flat, base_va, out_dir, attr_log=attr_log)
     else:
         # NB0 flat image (WM6+). Verify ARM branch at offset 0.
         sig = u32(data, 0)
@@ -228,16 +267,18 @@ def extract_image(bin_path):
         has_imgfs = find_imgfs_base(data) != -1
 
         print("\nExtracting XIP regions...")
-        extract_xip_regions(data, 0, out_dir)
+        extract_xip_regions(data, 0, out_dir, attr_log=attr_log)
 
         if has_imgfs:
             print("\nExtracting IMGFS filesystem...")
-            extract_imgfs(data, out_dir)
+            extract_imgfs(data, out_dir, attr_log=attr_log)
 
     win_dir = os.path.join(out_dir, "Windows")
     if os.path.isdir(win_dir):
-        _post_process_fs(out_dir, win_dir)
+        _post_process_fs(out_dir, win_dir, attr_log=attr_log)
         _post_process_registry(out_dir, win_dir)
+
+    _write_attribute_ini(out_dir, attr_log)
 
     print(f"\nDone -> {out_dir}")
     return True

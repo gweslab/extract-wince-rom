@@ -229,9 +229,15 @@ def find_imgfs_base(data):
         pos = idx + 1
 
 
-def extract_imgfs(data, output_dir):
+def extract_imgfs(data, output_dir, attr_log=None):
     """Locate and extract all files from the IMGFS filesystem.
-    Handles both FTL-mapped and direct-addressed (NOR) images."""
+    Handles both FTL-mapped and direct-addressed (NOR) images.
+
+    attr_log: optional dict; if provided, records the original CE file
+              attribute bits and FILETIME for every emitted file/module as
+              attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
+              Per-IMGFS-dirent: attrs at +0x1c, filetime at +0x20..+0x28.
+    """
     imgfs_base = find_imgfs_base(data)
     if imgfs_base == -1:
         return
@@ -311,6 +317,10 @@ def extract_imgfs(data, output_dir):
                 with open(path, 'wb') as f:
                     f.write(fdata)
                 files_ok += 1
+                if attr_log is not None:
+                    attrs = u32(raw, 0x1c)
+                    ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    attr_log['\\Windows\\' + name] = (attrs, ft)
             else:
                 files_fail += 1
             i += 1
@@ -379,6 +389,10 @@ def extract_imgfs(data, output_dir):
 
             if wrote:
                 mods_ok += 1
+                if attr_log is not None:
+                    attrs = u32(raw, 0x1c)
+                    ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    attr_log['\\Windows\\' + name] = (attrs, ft)
             else:
                 mods_fail += 1
 
