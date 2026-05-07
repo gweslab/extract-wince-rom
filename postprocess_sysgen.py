@@ -16,19 +16,33 @@ Default output_dir: `<sysgen_dir>_processed`.
 """
 
 import os
+import shutil
 import sys
 
 from winmob_extract.extract import _post_process_fs, _post_process_registry
 
 
 def process_sysgen(sysgen_dir, out_dir):
-    win_dir = os.path.join(sysgen_dir, "Windows")
-    if not os.path.isdir(win_dir):
-        win_dir = sysgen_dir
+    src_dir = os.path.join(sysgen_dir, "Windows")
+    if not os.path.isdir(src_dir):
+        src_dir = sysgen_dir
 
-    print(f"Source: {win_dir}")
+    win_dir = os.path.join(out_dir, "Windows")
+    print(f"Source: {src_dir}")
     print(f"Output: {out_dir}")
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(win_dir, exist_ok=True)
+
+    # Mirror the sysgen tree into <out>/Windows/ so the output mirrors a
+    # ROM-extraction layout (canonical \Windows\ + placement copies on top).
+    copied = 0
+    for root, dirs, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        dst_root = win_dir if rel == '.' else os.path.join(win_dir, rel)
+        os.makedirs(dst_root, exist_ok=True)
+        for f in files:
+            shutil.copy2(os.path.join(root, f), os.path.join(dst_root, f))
+            copied += 1
+    print(f"  {copied} files mirrored -> {win_dir}")
 
     _post_process_fs(out_dir, win_dir)
     _post_process_registry(out_dir, win_dir)
