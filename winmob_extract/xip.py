@@ -1,17 +1,27 @@
 """XIP region extraction: locate ECEC signatures, parse ROMHDR + TOC, emit
-PE files for each module and verbatim copies for non-module files."""
+PE files for each module and verbatim copies for non-module files.
 
+The ECEC marker (signature 'CECE' little-endian) sits at physfirst+0x40
+per romldr.h, followed by ROM_TOC_POINTER_OFFSET (+0x44) and
+ROM_TOC_OFFSET_OFFSET (+0x48). Pre-CE5 ROMs only define the signature
+slot; +4/+8 may be unused or used as an undocumented convenience.
+"""
+
+import base64
 import os
 import struct
 
-from .util import (u32, read_ascii, safe_filename,
+from .util import (u32, u16, read_ascii, safe_filename,
                    ROMHDR_SIZE, TOCENTRY_SIZE, FILEENTRY_SIZE)
 from .compress import ce_rom_decompress
 from .pe import reconstruct_pe_xip
 
 
 def find_all_ecec(data, limit=None):
-    """Find all ECEC signatures that look like valid XIP region markers."""
+    """Find all ECEC signatures that look like valid XIP region markers.
+
+    Returns a list of (ecec_offset, ptoc_va, romhdr_offset). The last two
+    fields come from u32 reads at ECEC+4 and ECEC+8."""
     results = []
     end = limit if limit else len(data)
     pos = 0
@@ -20,11 +30,11 @@ def find_all_ecec(data, limit=None):
         if idx == -1 or idx >= end:
             break
         if idx + 12 <= len(data):
-            romhdr_va = u32(data, idx + 4)
-            romhdr_phys = u32(data, idx + 8)
+            ptoc_va = u32(data, idx + 4)
+            romhdr_off = u32(data, idx + 8)
             # VA should be in CE kernel range
-            if 0x80000000 <= romhdr_va < 0xC0000000 and romhdr_phys < 0x10000000:
-                results.append((idx, romhdr_va, romhdr_phys))
+            if 0x80000000 <= ptoc_va < 0xC0000000 and romhdr_off < 0x10000000:
+                results.append((idx, ptoc_va, romhdr_off))
         pos = idx + 4
     return results
 
@@ -58,7 +68,72 @@ def parse_romhdr(data, off):
     return hdr
 
 
-def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
+def parse_rompid_chain(data, load_offset, head_va):
+    """Walk a ROMPID extension linked list starting at head_va. Returns a
+    list of dicts ready for rom_meta.json's `rompid` field. Empty list when
+    head_va is 0 or the chain doesn't parse.
+
+    Layout assumed (per CE conventions): each ROMPID node has
+        type        : DWORD
+        pNextExt    : DWORD (VA of next, 0 = end)
+        pdata       : DWORD (VA of data blob)
+        length      : DWORD (data length)
+        pszName     : DWORD (VA of ASCII name string)
+    Total 20 bytes. Inline-name layouts (no pszName VA) are not handled
+    here; the chain bails on the first node that produces inconsistent
+    values rather than emit garbage.
+    """
+    chain = []
+    seen = set()
+    node_va = head_va
+    while node_va and node_va not in seen and len(chain) < 64:
+        seen.add(node_va)
+        node_off = node_va - load_offset
+        if not (0 <= node_off and node_off + 20 <= len(data)):
+            break
+        type_, next_va, pdata_va, length, name_va = \
+            struct.unpack_from('<5I', data, node_off)
+        # Sanity gate: length should be reasonable
+        if length > 0x10000000:
+            break
+        # Treat all-zero / placeholder nodes as "no extension". Real
+        # ROMPID entries have at least a type or a name pointer or a
+        # non-zero data length.
+        if type_ == 0 and length == 0 and name_va == 0 and pdata_va == 0:
+            break
+        # Decode name if pointer is plausible
+        name = ''
+        if 0 < name_va:
+            name_off = name_va - load_offset
+            if 0 <= name_off < len(data) - 1:
+                name = read_ascii(data, name_off)
+        # Decode data blob if pointer is plausible
+        data_b64 = ''
+        if length and 0 < pdata_va:
+            pdata_off = pdata_va - load_offset
+            if 0 <= pdata_off and pdata_off + length <= len(data):
+                data_b64 = base64.b64encode(
+                    data[pdata_off:pdata_off + length]).decode('ascii')
+        chain.append({
+            'name': name,
+            'type': type_,
+            'data_b64': data_b64,
+            'length': length,
+        })
+        node_va = next_va
+    return chain
+
+
+def _hex(v):
+    return f"0x{v & 0xFFFFFFFF:08X}"
+
+
+def _hex16(v):
+    return f"0x{v & 0xFFFF:04X}"
+
+
+def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
+                        heuristic=False, rom_meta=None):
     """Find and extract all XIP regions from a flat image.
 
     data:        flat image bytes
@@ -69,6 +144,10 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
     attr_log:    optional dict; if provided, records the original CE file
                  attribute bits and FILETIME for every emitted module/file as
                  attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
+    heuristic:   forwarded to reconstruct_pe_xip; controls whether the
+                 legacy synth/un-rebase passes run. Default off (raw mode).
+    rom_meta:    optional dict; if provided, populated with ROMHDR fields,
+                 module/file inventory, and ptoc/rompid metadata.
     """
     ecec_limit = min(len(data), 0x800000)  # ECEC should be in first 8 MB
     ececs = find_all_ecec(data, limit=ecec_limit)
@@ -80,28 +159,25 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
     total_mods = 0
     total_files = 0
 
-    for ecec_off, romhdr_va, romhdr_phys in ececs:
-        if romhdr_phys:
-            # Standard layout: romhdr_phys is the file offset within the XIP region
+    for ecec_off, ptoc_va, romhdr_off_field in ececs:
+        if romhdr_off_field:
+            # ECEC+8 holds the ROMHDR offset from physfirst.
             xip_base = max(ecec_off - 0x40, 0)
-            romhdr_off = xip_base + romhdr_phys
-            load_offset = romhdr_va - romhdr_off
+            romhdr_off = xip_base + romhdr_off_field
+            load_offset = ptoc_va - romhdr_off
             candidates = [(romhdr_off, load_offset)]
         else:
-            # romhdr_phys=0: ROMHDR is reachable only via VA. Try the explicit
-            # base_offset first (WM2003 B000FF), then the kernel-VA mirror of
-            # base_offset (recent romimage emits B000FF with PHYSICAL addresses
-            # while ECEC still carries the VIRTUAL kernel address), then derive
-            # a load base from romhdr_va's high bits (NB0 PocketPC 2000, where
-            # the file is just the raw ROM mapped at e.g. 0x80000000 with no
-            # section header).
-            candidates = [(romhdr_va - base_offset, base_offset)]
+            # ECEC+8 zero: try the explicit base_offset, the kernel-VA
+            # mirror (some B000FF images carry physical addresses in the
+            # section table while ECEC still carries the virtual VA),
+            # and high-bit masks of the value at ECEC+4.
+            candidates = [(ptoc_va - base_offset, base_offset)]
             mirror = base_offset | 0x80000000
             if mirror != base_offset:
-                candidates.append((romhdr_va - mirror, mirror))
+                candidates.append((ptoc_va - mirror, mirror))
             for mask in (0xFF000000, 0xF0000000):
-                cand_load = romhdr_va & mask
-                cand_off = romhdr_va - cand_load
+                cand_load = ptoc_va & mask
+                cand_off = ptoc_va - cand_load
                 if (cand_off, cand_load) not in candidates:
                     candidates.append((cand_off, cand_load))
 
@@ -122,10 +198,34 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
         print(f"{label}  XIP @ 0x{ecec_off:X}: {nummods} modules, {numfiles} files "
               f"(load=0x{load_offset:08X})")
 
+        # Populate rom_meta on the first valid ROMHDR encountered.
+        if rom_meta is not None and rom_meta.get('romhdr') is None:
+            rom_meta['romhdr'] = {
+                'dllfirst':        _hex(hdr['dllfirst']),
+                'dlllast':         _hex(hdr['dlllast']),
+                'physfirst':       _hex(hdr['physfirst']),
+                'physlast':        _hex(hdr['physlast']),
+                'ulRAMStart':      _hex(hdr['ulRAMStart']),
+                'ulRAMFree_va':    _hex(hdr['ulRAMFree']),
+                'ulRAMEnd':        _hex(hdr['ulRAMEnd']),
+                'ulKernelFlags':   _hex(hdr['ulKernelFlags']),
+                'ulFSRamPercent':  _hex(hdr['ulFSRamPercent']),
+                'ulDrivglobStart': _hex(hdr['ulDrivglobStart']),
+                'ulDrivglobLen':   hdr['ulDrivglobLen'],
+                'usCPUType':       _hex16(hdr['usCPUType']),
+                'usMiscFlags':     _hex16(hdr['usMiscFlags']),
+                'ulTrackingStart': _hex(hdr['ulTrackingStart']),
+                'ulTrackingLen':   hdr['ulTrackingLen'],
+            }
+            rom_meta['rompid'] = parse_rompid_chain(
+                data, load_offset, hdr['pExtensions'])
+            rom_meta['_romhdr_va_raw'] = ptoc_va
+            rom_meta['_romhdr_off'] = romhdr_off_field
+
         if nummods == 0 and numfiles == 0:
             continue
 
-        out_dir = os.path.join(output_dir, "Windows")
+        out_dir = os.path.join(output_dir, "fs", "Windows")
         os.makedirs(out_dir, exist_ok=True)
 
         toc_start = romhdr_off + ROMHDR_SIZE
@@ -146,7 +246,8 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
             else:
                 fname = f"mod_{i}"
 
-            pe_data = reconstruct_pe_xip(data, load_offset, e32_va, o32_va, machine)
+            pe_data = reconstruct_pe_xip(data, load_offset, e32_va, o32_va,
+                                         machine, heuristic=heuristic)
             if pe_data:
                 outpath = os.path.join(out_dir, safe_filename(fname))
                 with open(outpath, 'wb') as f:
@@ -154,6 +255,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
                 extracted_mods += 1
                 if attr_log is not None:
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
+                if rom_meta is not None:
+                    e32_off = e32_va - load_offset
+                    e32_vsize = (u32(data, e32_off + 0x14)
+                                 if 0 <= e32_off and e32_off + 0x18 <= len(data)
+                                 else fsize)
+                    rom_meta['modules'].append({
+                        'name':            fname,
+                        'load_va':         _hex(loadoff_va),
+                        'vsize':           _hex(e32_vsize),
+                        'file_size':       fsize,
+                        'compressed':      bool(attrs & 0x800),
+                        'compressed_size': 0,  # XIP modules aren't compressed
+                        'attributes':      _hex(attrs),
+                        'filetime_lo':     _hex(ft_lo),
+                        'filetime_hi':     _hex(ft_hi),
+                    })
 
         # Extract files
         extracted_files = 0
@@ -183,6 +300,17 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
                 extracted_files += 1
                 if attr_log is not None:
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
+                if rom_meta is not None:
+                    rom_meta['files'].append({
+                        'name':            fname,
+                        'load_va':         _hex(loadoff),
+                        'real_size':       real_size,
+                        'compressed_size': comp_size,
+                        'compressed':      comp_size != real_size,
+                        'attributes':      _hex(attrs),
+                        'filetime_lo':     _hex(ft_lo),
+                        'filetime_hi':     _hex(ft_hi),
+                    })
 
         total_mods += extracted_mods
         total_files += extracted_files

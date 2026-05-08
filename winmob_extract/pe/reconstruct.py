@@ -16,7 +16,8 @@ from .build import build_pe, section_name
 from .e32 import (parse_e32_base, parse_e32_auto, O32_SIZE,
                   E32_DD_OFF_LEGACY, E32_DD_OFF_WM5)
 from .iat import fix_iat_from_ilt
-from .reloc import synthesize_reloc
+from .rebase import unrebase_dll
+from .reloc import synthesize_reloc, _existing_reloc_valid
 
 
 _DD_NAMES_SHORT = ['.edata', '.idata', '.rsrc', '.pdata', '.certs',
@@ -42,13 +43,43 @@ def _read_xip_sections(flat, base_off, o32, n, ce_dds, vbase):
                     dec = ce_rom_decompress(data, sv)
                     if len(dec) == sv:
                         data = dec
+        # When raw_size in ROM exceeds vsize, the bytes beyond vsize are
+        # whatever follows the section in ROM (often the next module's
+        # e32/o32 records). The source PE pads that gap with zeros - mirror
+        # that so the emitted PE tail bytes match.
+        if not (sf & 0x2000) and len(data) > sv:
+            data = data[:sv] + b'\x00' * (len(data) - sv)
         sections.append(dict(
-            name=section_name(sf, sr, ce_dds),
+            name=section_name(sf, sr, ce_dds, vsize=sv),
             vsize=sv, rva=sr, raw_size=len(data) if data else sp,
             flags=sf, data=data))
         if sa != 0 and sa != vbase + sr:
             realaddr_map.append((sr, sa, sv))
     return sections, realaddr_map
+
+
+def _resolve_section_overlaps(sections, ce_dds):
+    """Some modules have two o32 records sharing the same RVA (e.g. a
+    writable .data section and a read-only .pdata section overlaid),
+    because at runtime they live at different physical addresses (one
+    in RAM, one XIP). For an on-disk PE the sections must be at distinct
+    RVAs - shift each later section up to the next SectionAlignment-
+    aligned slot after the previous one ends, and update any data
+    directory that pointed at the old RVA."""
+    SA = 0x1000
+    sections.sort(key=lambda s: s['rva'])
+    for i in range(1, len(sections)):
+        prev = sections[i - 1]
+        cur = sections[i]
+        prev_end = prev['rva'] + max(prev['vsize'], prev['raw_size'])
+        prev_end_aligned = (prev_end + SA - 1) & ~(SA - 1)
+        if cur['rva'] < prev_end_aligned:
+            old_rva = cur['rva']
+            cur['rva'] = prev_end_aligned
+            for j in range(len(ce_dds)):
+                ddr, dds = ce_dds[j]
+                if ddr == old_rva and dds == cur['vsize']:
+                    ce_dds[j] = (cur['rva'], dds)
 
 
 def _add_dd_sections(flat, base_off, sections, ce_dds, vbase):
@@ -114,11 +145,14 @@ def _patch_realaddr_refs(sections, realaddr_map, vbase):
 
 
 def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
-                       dd_offset=None):
+                       dd_offset=None, heuristic=False):
     """Build PE from XIP module (separate e32/o32 pointers in flat image).
 
-    Auto-detects e32rom layout (legacy CE3/WM2003 vs WM5+) unless dd_offset
-    is explicitly given.
+    Default (raw) emits a ROM-faithful PE: bytes verbatim, ImageBase=vbase,
+    IAT bound, RELOCS_STRIPPED set when no reloc table preserved.
+    `heuristic=True` enables synth .reloc + un-rebase to 0x10000000 + IAT
+    unbinding; the synth pass has structural FPs that can corrupt embedded
+    constants and is not recommended for production.
     """
     e32 = e32_va - base_off
     o32 = o32_va - base_off
@@ -134,27 +168,53 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
 
     vbase = info['vbase']
     ce_dds = list(info['ce_dds'])  # mutable copy
+    imgflags = info['imgflags']
 
     sections, realaddr_map = _read_xip_sections(flat, base_off, o32, n,
                                                 info['ce_dds'], vbase)
     _add_dd_sections(flat, base_off, sections, ce_dds, vbase)
+    _resolve_section_overlaps(sections, ce_dds)
     _patch_realaddr_refs(sections, realaddr_map, vbase)
-    synthesize_reloc(sections, ce_dds, vbase)
+
+    # Did the ROM preserve the original .reloc bytes?
+    reloc_is_ground_truth = _existing_reloc_valid(sections, ce_dds)
+
+    if heuristic:
+        synthesize_reloc(sections, ce_dds, vbase, imgflags)
+    elif not reloc_is_ground_truth:
+        # Raw mode + no ground-truth reloc: drop any stale .reloc section
+        # _add_dd_sections may have synthesized, clear DD[5], and mark
+        # the PE as RELOCS_STRIPPED so loaders fail loud rather than
+        # apply an empty reloc table.
+        sections[:] = [s for s in sections
+                       if not s.get('name', b'').startswith(b'.reloc')]
+        ce_dds[5] = (0, 0)
+        imgflags |= 0x0001  # IMAGE_FILE_RELOCS_STRIPPED
 
     sections.sort(key=lambda s: s['rva'])
 
-    pe_data = build_pe(n, info['imgflags'], info['entry_rva'], vbase,
+    pe_data = build_pe(n, imgflags, info['entry_rva'], vbase,
                        info['sub_maj'], info['sub_min'], info['stackmax'],
                        info['vsize'], info['timestamp'], ce_dds,
                        sections, machine, info.get('subsystem', 9),
                        info.get('sect14_rva', 0), info.get('sect14_size', 0))
-    return fix_iat_from_ilt(pe_data) if pe_data else None
+    if not pe_data:
+        return None
+    # IAT directory metadata (DD[12]) is always populated; only the byte
+    # rewrite (bound -> unbound) is gated on heuristic mode.
+    pe_data = fix_iat_from_ilt(pe_data, rewrite_iat=heuristic)
+    if heuristic:
+        pe_data = unrebase_dll(pe_data,
+                               reloc_is_ground_truth=reloc_is_ground_truth)
+    return pe_data
 
 
-def reconstruct_pe_imgfs(header_data, section_data_map):
+def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False):
     """Build PE from IMGFS module (combined e32rom+o32_rom header blob).
 
-    IMGFS modules always use the WM5+-style e32rom layout.
+    Always uses the extended e32rom layout. Raw/heuristic split same as
+    reconstruct_pe_xip. IMGFS typically preserves source PE .reloc bytes
+    as a stored section, so DD[5] often stays populated even in raw mode.
     """
     if not header_data or len(header_data) < 0x70:
         return None
@@ -165,6 +225,9 @@ def reconstruct_pe_imgfs(header_data, section_data_map):
     if len(header_data) < 0x70 + n * O32_SIZE:
         return None
 
+    ce_dds = list(info['ce_dds'])
+    imgflags = info['imgflags']
+
     sections = []
     for s in range(n):
         so = 0x70 + s * O32_SIZE
@@ -172,14 +235,28 @@ def reconstruct_pe_imgfs(header_data, section_data_map):
         key = f'S{s:03d}'
         data = section_data_map.get(key, b'')
         sections.append(dict(
-            name=section_name(sf, sr, info['ce_dds']),
+            name=section_name(sf, sr, ce_dds, vsize=sv),
             vsize=sv, rva=sr, raw_size=len(data) if data else sp,
             flags=sf, data=data))
 
-    pe_data = build_pe(n, info['imgflags'], info['entry_rva'], info['vbase'],
+    reloc_is_ground_truth = _existing_reloc_valid(sections, ce_dds)
+
+    if not heuristic and not reloc_is_ground_truth:
+        sections[:] = [s for s in sections
+                       if not s.get('name', b'').startswith(b'.reloc')]
+        ce_dds[5] = (0, 0)
+        imgflags |= 0x0001  # IMAGE_FILE_RELOCS_STRIPPED
+
+    pe_data = build_pe(n, imgflags, info['entry_rva'], info['vbase'],
                        info['sub_maj'], info['sub_min'], info['stackmax'],
-                       info['vsize'], info['timestamp'], info['ce_dds'],
+                       info['vsize'], info['timestamp'], ce_dds,
                        sections, subsystem=info.get('subsystem', 9),
                        sect14_rva=info.get('sect14_rva', 0),
                        sect14_size=info.get('sect14_size', 0))
-    return fix_iat_from_ilt(pe_data) if pe_data else None
+    if not pe_data:
+        return None
+    pe_data = fix_iat_from_ilt(pe_data, rewrite_iat=heuristic)
+    if heuristic:
+        pe_data = unrebase_dll(pe_data,
+                               reloc_is_ground_truth=reloc_is_ground_truth)
+    return pe_data

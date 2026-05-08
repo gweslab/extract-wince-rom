@@ -1,12 +1,11 @@
 """e32rom header parsing and DD-layout auto-detection.
 
-The e32_rom struct has two known variants in CE / Windows Mobile ROMs:
+The e32_rom struct has two known variants in the wild:
 
-  - 'legacy' (CE3 / WM2003): data directory array starts at 0x20.
-  - WM5+-style              : an extra 4-byte field of unverified meaning sits
-                              at 0x20 (preserved verbatim and emitted as the
-                              output PE's COFF TimeDateStamp), pushing the DD
-                              array to 0x24.
+  - 'legacy'   : data directory array starts at 0x20.
+  - 'extended' : an extra 4-byte field of unverified meaning sits at
+                 0x20 (preserved verbatim and emitted as the output
+                 PE's COFF TimeDateStamp), pushing the DD array to 0x24.
 
 The right variant is detected per-module by parsing both candidates and
 picking the one whose DDs and subsystem look semantically valid.
@@ -15,8 +14,8 @@ picking the one whose DDs and subsystem look semantically valid.
 from ..util import u16, u32
 
 
-E32_DD_OFF_LEGACY = 0x20  # CE3 / WM2003
-E32_DD_OFF_WM5    = 0x24  # WM5+-style
+E32_DD_OFF_LEGACY = 0x20
+E32_DD_OFF_WM5    = 0x24  # name kept for back-compat; actual layout = "extended"
 O32_SIZE = 24             # sizeof(o32_rom)
 
 
@@ -32,11 +31,9 @@ def parse_e32_base(data, off, dd_offset):
     sub_min   = u16(data, off + 0x0E)
     stackmax  = u32(data, off + 0x10)
     vsize     = u32(data, off + 0x14)
-    # WM5+ e32rom has a 4-byte field at offset 0x20 that the CE3/WM2003 (legacy)
-    # layout lacks (in the legacy layout, DD[0] sits there instead). Empirically
-    # the value is sometimes a Unix timestamp matching the build date, but more
-    # often is unrecognizable (likely a compiler-generated hash). Semantic meaning
-    # is unverified; preserved verbatim and emitted into the output COFF TimeDateStamp.
+    # The extended layout has a 4-byte field at +0x20 the legacy layout
+    # lacks (legacy puts DD[0] there instead). Semantics unverified;
+    # preserved verbatim into the output COFF TimeDateStamp.
     ts = u32(data, off + 0x20) if dd_offset == E32_DD_OFF_WM5 else 0
 
     ce_dds = []
@@ -58,8 +55,10 @@ def parse_e32_base(data, off, dd_offset):
 
 
 def _layout_valid(info):
-    """Heuristic: does this parse look semantically right? Catches DD offset
-    mismatches between CE3/WM2003 (legacy) and WM5+-style layouts."""
+    """Strict validity check on a parsed layout. Rejects values that
+    can't come from a real PE - DD RVAs in the header region, sizes
+    exceeding image bounds, etc. - so the auto-detector can tell
+    apart legacy and extended on a per-module basis."""
     if info is None:
         return False
     if info['subsystem'] not in (1, 2, 3, 7, 9, 10, 11):
@@ -74,16 +73,45 @@ def _layout_valid(info):
             return False
         if rva and sz and rva + sz > vsize + 0x1000:  # allow small header slop
             return False
+        # Real DDs sit in their own sections, never inside the PE header.
+        # When parsing with the wrong dd_offset, RVAs shift to (prev_sz)
+        # and frequently land below 0x100.
+        if rva and rva < 0x100:
+            return False
     return True
 
 
+def _layout_score(info):
+    """Tie-breaker score: how plausible does this layout look?
+
+    Page-aligned DD RVAs are a strong signal: BASERELOC, IMPORT,
+    EXCEPTION, DEBUG, etc. live at the start of their own sections,
+    so their RVAs are usually 0x1000-aligned. The wrong dd_offset
+    shifts RVAs into mid-section sizes, which are almost never aligned."""
+    if info is None:
+        return -1
+    score = 0
+    for rva, sz in info['ce_dds']:
+        if rva and (rva & 0xFFF) == 0:
+            score += 2
+        if rva and sz:
+            score += 1
+    return score
+
+
 def parse_e32_auto(data, off):
-    """Detect e32rom DD layout by parsing both candidates and picking the one
-    whose DDs and subsystem make sense. Returns (info, dd_offset) or (None, None)."""
-    info = parse_e32_base(data, off, E32_DD_OFF_WM5)
-    if _layout_valid(info):
-        return info, E32_DD_OFF_WM5
-    info = parse_e32_base(data, off, E32_DD_OFF_LEGACY)
-    if _layout_valid(info):
-        return info, E32_DD_OFF_LEGACY
-    return None, None
+    """Detect e32rom DD layout. Try both, pick the higher-scoring valid one.
+    Returns (info, dd_offset) or (None, None)."""
+    candidates = []
+    info_wm5 = parse_e32_base(data, off, E32_DD_OFF_WM5)
+    if _layout_valid(info_wm5):
+        candidates.append((_layout_score(info_wm5), info_wm5, E32_DD_OFF_WM5))
+    info_leg = parse_e32_base(data, off, E32_DD_OFF_LEGACY)
+    if _layout_valid(info_leg):
+        candidates.append((_layout_score(info_leg), info_leg, E32_DD_OFF_LEGACY))
+    if not candidates:
+        return None, None
+    # Highest score wins; on tie, WM5 wins (newer layout, listed first).
+    candidates.sort(key=lambda c: -c[0])
+    _, info, off_used = candidates[0]
+    return info, off_used

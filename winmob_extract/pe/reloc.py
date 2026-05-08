@@ -1,29 +1,13 @@
-"""Synthesize a PE base-relocation directory for an XIP module.
+"""Synthesize a PE base-relocation directory for a ROM-stripped XIP module.
 
-The ROM builder strips the original .reloc directory (XIP modules don't
-need it at load time, since they run at a fixed VA). To produce a PE
-that can be loaded at any base, we reconstruct .reloc by scanning the
-section bytes for 4-byte values that look like absolute references to
-something in the module's image range.
-
-This pass is inherently approximate — there is no ground truth. False
-positives have shipped multiple times (resource sentinels, ARM instruction
-encodings). See README.md for the full caveat.
+The pass is approximate - the original .reloc was deleted by romimage,
+and any 4-byte aligned value in [vbase, vbase + image_size) could be a
+real pointer or a coincidental constant. Best-effort only; only used in
+heuristic-reconstruction mode.
 
 Top-level entry point:
-    synthesize_reloc(sections, ce_dds, vbase) -> (reloc_data, reloc_rva)
-        Mutates `sections` in place: appends a .reloc section if any
-        relocations were found. Mutates `ce_dds[5]` to point at it.
-        Returns (b'', 0) when there are no relocations.
-
-The scanner is split into three passes:
-  1. ARM/Thumb LDR-PC literal pools inside .text
-  2. Gaps between functions in .text (per .pdata) - data interleaved with code
-  3. Whole-section scan in writable / non-resource data sections
-
-Low-base modules (vbase < size_of_image) get an exclude list of RVA-based
-PE structures (export name table, import descriptors, IAT, etc.) whose
-small offsets coincidentally fall in the image range.
+    synthesize_reloc(sections, ce_dds, vbase, imgflags) -> (data, rva)
+        Mutates `sections` and `ce_dds[5]` in place.
 """
 
 import struct
@@ -31,85 +15,13 @@ import struct
 from ..util import align
 
 
-# ── Scanners ────────────────────────────────────────────────────────────────
-
-def _find_literal_pool_offsets(text_data):
-    """Scan .text for ARM/Thumb LDR [PC, #offset] instructions and return
-    the set of literal pool data offsets (byte offsets within text_data)."""
-    pool = set()
-    sz = len(text_data)
-    # ARM mode: 4-byte aligned LDR Rd, [PC, #offset]
-    for i in range(0, sz - 3, 4):
-        instr = struct.unpack_from('<I', text_data, i)[0]
-        if (instr & 0x0F7F0000) == 0x051F0000:
-            off12 = instr & 0xFFF
-            addr = i + 8 + off12 if (instr >> 23) & 1 else i + 8 - off12
-            if 0 <= addr <= sz - 4 and (addr & 3) == 0:
-                pool.add(addr)
-    # Thumb mode: 2-byte aligned
-    for i in range(0, sz - 1, 2):
-        hw = struct.unpack_from('<H', text_data, i)[0]
-        # Thumb 16-bit: LDR Rd, [PC, #imm8*4]
-        if (hw & 0xF800) == 0x4800:
-            addr = ((i + 4) & ~3) + (hw & 0xFF) * 4
-            if 0 <= addr <= sz - 4 and (addr & 3) == 0:
-                pool.add(addr)
-        # Thumb-2 32-bit: LDR.W Rd, [PC, #imm12]
-        elif (hw & 0xFF7F) == 0xF85F and i + 3 < sz:
-            hw2 = struct.unpack_from('<H', text_data, i + 2)[0]
-            off12 = hw2 & 0xFFF
-            base = (i + 4) & ~3
-            addr = base + off12 if (hw >> 7) & 1 else base - off12
-            if 0 <= addr <= sz - 4 and (addr & 3) == 0:
-                pool.add(addr)
-    return pool
-
-
-def _get_code_ranges(sections, vbase, pdata_rva, pdata_sz, text_rva, text_vsize):
-    """Parse .pdata to get sorted (start, end) code ranges within .text."""
-    ranges = []
-    for sec in sections:
-        if sec['data'] and sec['rva'] <= pdata_rva < sec['rva'] + len(sec['data']):
-            base = pdata_rva - sec['rva']
-            for i in range(pdata_sz // 8):
-                eo = base + i * 8
-                if eo + 8 > len(sec['data']):
-                    break
-                begin_rva = struct.unpack_from('<I', sec['data'], eo)[0]
-                flags = struct.unpack_from('<I', sec['data'], eo + 4)[0]
-                func_len = (flags >> 8) & 0x3FFFFF
-                insn_sz = 4 if (flags >> 30) & 1 else 2
-                fs = begin_rva - vbase - text_rva
-                fe = fs + func_len * insn_sz
-                if 0 <= fs < text_vsize:
-                    ranges.append((fs, min(fe, text_vsize)))
-            break
-    ranges.sort()
-    return ranges
-
-
-def _is_in_code(off, code_ranges):
-    """Binary search: is byte offset `off` inside any (start, end) range?"""
-    lo, hi = 0, len(code_ranges) - 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        s, e = code_ranges[mid]
-        if off < s:
-            hi = mid - 1
-        elif off >= e:
-            lo = mid + 1
-        else:
-            return True
-    return False
-
-
-# ── Exclude builder for low-base modules ────────────────────────────────────
+# ── Exclude builder ─────────────────────────────────────────────────────────
 
 def _build_excludes(sections, ce_dds):
-    """Return [(start_rva, end_rva), ...] of RVAs that look like image-range
-    pointers but are actually fields of PE metadata (export name table,
-    import descriptors, IAT, etc.). Only relevant for low-base modules
-    (vbase < size_of_image) where these small RVAs collide with image VAs."""
+    """Return [(start_rva, end_rva), ...] of regions that look like
+    image-range pointers but are PE metadata, not absolute pointers:
+    export name/ordinal tables, import descriptor RVA fields,
+    resource directory, debug directory, IAT."""
     exclude = []
 
     def _sec_data_at(rva):
@@ -118,7 +30,6 @@ def _build_excludes(sections, ce_dds):
                 return s['data'], rva - s['rva']
         return None, 0
 
-    # Export directory (DD[0]): exclude header + name tables, NOT function table
     exp_rva, exp_sz = ce_dds[0] if len(ce_dds) > 0 else (0, 0)
     if exp_rva and exp_sz:
         exclude.append((exp_rva, exp_rva + 40))  # IMAGE_EXPORT_DIRECTORY header
@@ -132,7 +43,6 @@ def _build_excludes(sections, ce_dds):
             if ords_rva:
                 exclude.append((ords_rva, ords_rva + num_names * 2))
 
-    # Import directory (DD[1]): exclude descriptor array + ILT regions
     imp_rva, imp_sz = ce_dds[1] if len(ce_dds) > 1 else (0, 0)
     if imp_rva and imp_sz:
         exclude.append((imp_rva, imp_rva + imp_sz))
@@ -155,14 +65,15 @@ def _build_excludes(sections, ce_dds):
                         exclude.append((ilt_rva, ilt_rva + (end2 - off2)))
                 pos += 20
 
-    # Resource (DD[2]), Exception/pdata (DD[3]), Debug (DD[6]): all RVA-based
-    for dd_i in (2, 3, 6):
+    # Resource (DD[2]) and Debug (DD[6]) entries are pure RVAs / file
+    # offsets - exclude. Exception/pdata (DD[3]) holds absolute
+    # BeginAddress fields under this ABI and does need reloc - not excluded.
+    for dd_i in (2, 6):
         if dd_i < len(ce_dds):
             dd_rva, dd_sz = ce_dds[dd_i]
             if dd_rva and dd_sz:
                 exclude.append((dd_rva, dd_rva + dd_sz))
 
-    # IAT (CE DD[7] -> PE DD[12]): ordinal hints after IAT fix
     if len(ce_dds) > 7:
         iat_rva, iat_sz = ce_dds[7]
         if iat_rva and iat_sz:
@@ -171,20 +82,20 @@ def _build_excludes(sections, ce_dds):
     return exclude
 
 
-# ── Main scanner: find absolute references in section bytes ─────────────────
+# ── Scanner ─────────────────────────────────────────────────────────────────
 
-def _find_reloc_rvas(sections, ce_dds, vbase, img_end, exclude):
-    """Walk every section; for each 4-byte value that falls in [vbase, img_end),
-    record its RVA as needing a base-relocation entry. Honours `exclude`."""
+def _find_reloc_rvas(sections, ce_dds, img_lo, img_end, exclude):
+    """Walk every section; record RVAs of 4-byte values that fall in
+    [img_lo, img_end). Honours `exclude`. `img_lo` is `vbase + first_section_rva`
+    so values pointing into the PE header region are not flagged."""
     pdata_rva, pdata_sz = ce_dds[3] if len(ce_dds) > 3 else (0, 0)
     rsrc_rva, rsrc_sz = ce_dds[2] if len(ce_dds) > 2 else (0, 0)
 
     def _is_rsrc_section(sec):
-        if rsrc_rva and rsrc_sz:
-            sec_end = sec['rva'] + max(sec['vsize'], len(sec['data']))
-            if sec['rva'] <= rsrc_rva < sec_end:
-                return True
-        return False
+        if not (rsrc_rva and rsrc_sz):
+            return False
+        sec_end = sec['rva'] + max(sec['vsize'], len(sec['data']))
+        return sec['rva'] <= rsrc_rva < sec_end
 
     def _in_exclude(rva):
         for start, end in exclude:
@@ -196,36 +107,20 @@ def _find_reloc_rvas(sections, ce_dds, vbase, img_end, exclude):
     for sec in sections:
         if not sec['data'] or sec['name'].startswith(b'.reloc'):
             continue
-        if sec['flags'] & 0x20:
-            # Code section: LDR pools (within functions) + pdata gaps (between functions)
-            ldr_offsets = _find_literal_pool_offsets(sec['data'])
-            pdata_offsets = set()
-            if pdata_rva and pdata_sz:
-                code_ranges = _get_code_ranges(sections, vbase, pdata_rva, pdata_sz,
-                                               sec['rva'], sec['vsize'])
-                if code_ranges:
-                    for off in range(0, len(sec['data']) - 3, 4):
-                        if not _is_in_code(off, code_ranges):
-                            val = struct.unpack_from('<I', sec['data'], off)[0]
-                            if vbase <= val < img_end:
-                                pdata_offsets.add(off)
-            for off in sorted(ldr_offsets | pdata_offsets):
-                val = struct.unpack_from('<I', sec['data'], off)[0]
-                if vbase <= val < img_end:
-                    abs_rva = sec['rva'] + off
-                    if not _in_exclude(abs_rva):
-                        rvas.append(abs_rva)
-        else:
-            # Skip resource section (identified by IMAGE_DIRECTORY_ENTRY_RESOURCE)
-            if _is_rsrc_section(sec):
-                continue
-            # Data sections: scan all 4-byte aligned values
-            for off in range(0, len(sec['data']) - 3, 4):
-                val = struct.unpack_from('<I', sec['data'], off)[0]
-                if vbase <= val < img_end:
-                    abs_rva = sec['rva'] + off
-                    if not _in_exclude(abs_rva):
-                        rvas.append(abs_rva)
+        if not (sec['flags'] & 0x20) and _is_rsrc_section(sec):
+            continue
+        # .pdata stride 8: each entry is (BeginAddress, flags+length);
+        # only BeginAddress is a real pointer.
+        stride = 4
+        if (pdata_rva and pdata_sz and
+            sec['rva'] <= pdata_rva < sec['rva'] + max(sec['vsize'], len(sec['data']))):
+            stride = 8
+        for off in range(0, len(sec['data']) - 3, stride):
+            val = struct.unpack_from('<I', sec['data'], off)[0]
+            if img_lo <= val < img_end:
+                abs_rva = sec['rva'] + off
+                if not _in_exclude(abs_rva):
+                    rvas.append(abs_rva)
     return rvas
 
 
@@ -242,7 +137,7 @@ def _build_reloc_blocks(reloc_rvas):
             entries.append((3 << 12) | (reloc_rvas[i] & 0xFFF))
             i += 1
         if len(entries) & 1:
-            entries.append(0)  # padding to align block to 4 bytes
+            entries.append(0)  # 4-byte alignment padding
         block_sz = 8 + len(entries) * 2
         out += struct.pack('<II', page, block_sz)
         for e in entries:
@@ -252,24 +147,78 @@ def _build_reloc_blocks(reloc_rvas):
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-def synthesize_reloc(sections, ce_dds, vbase):
-    """Build a PE base-relocation directory for the given module.
+def _is_valid_reloc_blob(data, max_sz):
+    """Do these bytes parse as PE base-relocation blocks? Used to detect
+    a stale DD[5] pointer whose underlying bytes were stripped."""
+    if len(data) < 12:
+        return False
+    p = 0
+    blocks_ok = 0
+    while p + 8 <= len(data) and p < max_sz:
+        page = struct.unpack_from('<I', data, p)[0]
+        blk = struct.unpack_from('<I', data, p + 4)[0]
+        if blk == 0:
+            break
+        if page & 0xFFF:
+            return False
+        if blk < 8 or (blk & 1) or blk > max_sz - p:
+            return False
+        n = (blk - 8) // 2
+        for i in range(n):
+            if p + 8 + i * 2 + 2 > len(data):
+                return False
+            w = struct.unpack_from('<H', data, p + 8 + i * 2)[0]
+            if (w >> 12) > 10:
+                return False
+        blocks_ok += 1
+        p += blk
+    return blocks_ok > 0
 
-    Mutates `sections` in place: appends a .reloc section if any relocations
-    were found. Mutates `ce_dds[5]` to point at it.
 
-    Returns (reloc_data, reloc_rva); both empty when no relocations exist.
+def _existing_reloc_valid(sections, ce_dds):
+    """True iff ce_dds[5] points into a section whose bytes parse as
+    a valid reloc table."""
+    rel_rva, rel_sz = ce_dds[5]
+    if not (rel_rva and rel_sz):
+        return False
+    for sec in sections:
+        if not sec.get('data'):
+            continue
+        sec_end = sec['rva'] + len(sec['data'])
+        if sec['rva'] <= rel_rva < sec_end:
+            off = rel_rva - sec['rva']
+            return _is_valid_reloc_blob(sec['data'][off:off + rel_sz], rel_sz)
+    return False
+
+
+def synthesize_reloc(sections, ce_dds, vbase, imgflags=0):
+    """Build a synthetic .reloc directory. Mutates `sections` and
+    `ce_dds[5]` in place. Returns (reloc_data, reloc_rva); both empty
+    when no synth is needed.
+
+    Skips when imgflags has IMAGE_FILE_RELOCS_STRIPPED (CE EXEs) or when
+    the ROM preserved a valid .reloc table at DD[5]. When DD[5] points at
+    stripped bytes, drops the stale section and rebuilds.
     """
+    if imgflags & 0x0001:
+        return b'', 0
+    if _existing_reloc_valid(sections, ce_dds):
+        return b'', 0
+    sections[:] = [s for s in sections if not s.get('name', b'').startswith(b'.reloc')]
+    ce_dds[5] = (0, 0)
+
     SA = 0x1000
     size_of_image = align(max(s['rva'] + s['vsize'] for s in sections), SA)
-    # Saturate image end at 32-bit boundary to prevent wrap-around for high-base modules
     img_end = min(vbase + size_of_image, 0x100000000)
 
-    # Build exclude ranges only for low-base modules where RVAs can collide
-    # with image VAs. High-base modules can't have such collisions.
-    exclude = _build_excludes(sections, ce_dds) if vbase < size_of_image else []
+    img_lo = vbase
+    if any(s['data'] for s in sections):
+        first_sec_rva = min(s['rva'] for s in sections if s['data'])
+        img_lo = vbase + first_sec_rva
 
-    reloc_rvas = _find_reloc_rvas(sections, ce_dds, vbase, img_end, exclude)
+    exclude = _build_excludes(sections, ce_dds)
+
+    reloc_rvas = _find_reloc_rvas(sections, ce_dds, img_lo, img_end, exclude)
     if not reloc_rvas:
         return b'', 0
 

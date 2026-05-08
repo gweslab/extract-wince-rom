@@ -229,7 +229,7 @@ def find_imgfs_base(data):
         pos = idx + 1
 
 
-def extract_imgfs(data, output_dir, attr_log=None):
+def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=None):
     """Locate and extract all files from the IMGFS filesystem.
     Handles both FTL-mapped and direct-addressed (NOR) images.
 
@@ -237,6 +237,9 @@ def extract_imgfs(data, output_dir, attr_log=None):
               attribute bits and FILETIME for every emitted file/module as
               attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
               Per-IMGFS-dirent: attrs at +0x1c, filetime at +0x20..+0x28.
+    heuristic: forwarded to reconstruct_pe_imgfs.
+    rom_meta:  optional dict; populated with module/file inventory from
+               IMGFS dirents.
     """
     imgfs_base = find_imgfs_base(data)
     if imgfs_base == -1:
@@ -287,7 +290,7 @@ def extract_imgfs(data, output_dir, attr_log=None):
             magic = u32(raw, 0)
             all_entries.append((eo, raw, magic))
 
-    out_dir = os.path.join(output_dir, "Windows")
+    out_dir = os.path.join(output_dir, "fs", "Windows")
     os.makedirs(out_dir, exist_ok=True)
 
     files_ok = mods_ok = 0
@@ -321,6 +324,19 @@ def extract_imgfs(data, output_dir, attr_log=None):
                     attrs = u32(raw, 0x1c)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
                     attr_log['\\Windows\\' + name] = (attrs, ft)
+                if rom_meta is not None:
+                    attrs = u32(raw, 0x1c)
+                    ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    rom_meta['files'].append({
+                        'name':            name,
+                        'load_va':         '0x00000000',
+                        'real_size':       file_size,
+                        'compressed_size': file_size,
+                        'compressed':      False,
+                        'attributes':      f'0x{attrs:08X}',
+                        'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
+                        'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',
+                    })
             else:
                 files_fail += 1
             i += 1
@@ -361,7 +377,7 @@ def extract_imgfs(data, output_dir, attr_log=None):
 
             wrote = False
             if sec_data and header:
-                pe = reconstruct_pe_imgfs(header, sec_data)
+                pe = reconstruct_pe_imgfs(header, sec_data, heuristic=heuristic)
                 if pe:
                     path = os.path.join(out_dir, safe_filename(name))
                     with open(path, 'wb') as f:
@@ -393,6 +409,20 @@ def extract_imgfs(data, output_dir, attr_log=None):
                     attrs = u32(raw, 0x1c)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
                     attr_log['\\Windows\\' + name] = (attrs, ft)
+                if rom_meta is not None:
+                    attrs = u32(raw, 0x1c)
+                    ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    rom_meta['modules'].append({
+                        'name':            name,
+                        'load_va':         '0x00000000',  # IMGFS modules paged-loaded
+                        'vsize':           f'0x{file_size:08X}',
+                        'file_size':       file_size,
+                        'compressed':      False,
+                        'compressed_size': 0,
+                        'attributes':      f'0x{attrs:08X}',
+                        'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
+                        'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',
+                    })
             else:
                 mods_fail += 1
 

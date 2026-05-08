@@ -4,8 +4,10 @@
     3. (NB0 only) Walk IMGFS filesystem -> emit files / modules
     4. Post-process: rebuild directory tree from initflashfiles.dat / initobj.dat
     5. Post-process: convert registry blobs (.rgu / .hv / default.fdf) into <out>/Registry/
+    6. Emit rom_meta.json with ROMHDR fields, module/file inventory, romhdr_va
 """
 
+import json
 import os
 import re
 import shutil
@@ -25,9 +27,13 @@ def _decode_hex_name(s):
                   lambda m: chr(int(m.group(1), 16)), s)
 
 
-def _post_process_fs(out_dir, win_dir, attr_log=None):
+def _post_process_fs(fs_dir, win_dir, attr_log=None):
     """Rebuild directory tree from initflashfiles.dat (WM5+) or
     initobj.dat (CE3 / WM2003). Same syntax in all of them.
+
+    Files are placed under `fs_dir` (typically `<out>/fs/`) so the
+    bundled filesystem stays separate from `<out>/Registry/`,
+    `<out>/Sections/`, `<out>/attributes.ini`, `<out>/rom_meta.json`.
 
     If attr_log is given (mapping '\\Windows\\<name>' -> (attrs, filetime)),
     each placed file gets an additional entry under its placed CE path so
@@ -72,7 +78,7 @@ def _post_process_fs(out_dir, win_dir, attr_log=None):
                 full = parent + chr(92) + child
             else:
                 full = chr(92) + child
-            host = os.path.join(out_dir, full.lstrip(chr(92)).replace(chr(92), os.sep))
+            host = os.path.join(fs_dir, full.lstrip(chr(92)).replace(chr(92), os.sep))
             os.makedirs(host, exist_ok=True)
             dirs_created += 1
             continue
@@ -90,7 +96,7 @@ def _post_process_fs(out_dir, win_dir, attr_log=None):
             src_file = os.path.basename(src_path)
             src_full = os.path.join(win_dir, src_file)
 
-            dest_full_dir = os.path.join(out_dir, dest_dir.lstrip(chr(92)).replace(chr(92), os.sep))
+            dest_full_dir = os.path.join(fs_dir, dest_dir.lstrip(chr(92)).replace(chr(92), os.sep))
             os.makedirs(dest_full_dir, exist_ok=True)
             dest_full = os.path.join(dest_full_dir, dest_name)
 
@@ -216,10 +222,83 @@ def _write_attribute_ini(out_dir, attr_log):
     print(f"  attribute map ({len(attr_log)} entries) -> {path}")
 
 
+# ── rom_meta.json ───────────────────────────────────────────────────────────
+
+def _new_rom_meta():
+    """Initial empty rom_meta state. Populated as extraction progresses."""
+    return {
+        'rom_meta_version': 1,
+        'kernel_binary':    '',
+        'romhdr_va':        '',
+        'romhdr':           None,
+        'rompid':           [],
+        'modules':          [],
+        'files':            [],
+        # Internal scratch (stripped before emit):
+        '_romhdr_va_raw':   0,    # u32 at ECEC+4
+        '_romhdr_off':      0,    # u32 at ECEC+8
+    }
+
+
+_KERNEL_NAMES = ('nk.exe', 'kern.exe', 'kernel.dll')
+
+
+def _finalize_rom_meta(rom_meta):
+    """Identify the kernel binary and emit `romhdr_va` from the value at
+    ECEC+4. Same code path for CE3 / CE5 / CE6 / CE7 - romimage writes
+    the same field across versions, even though CE3's romldr.h does not
+    define ROM_TOC_POINTER_OFFSET formally.
+
+    Cross-check: when ECEC+8 (ROM_TOC_OFFSET_OFFSET) is non-zero, it
+    must agree with ECEC+4 via `physfirst + (ECEC+8) == ECEC+4`. CE3
+    ROMs don't populate ECEC+8 reliably, so the check is gated on
+    non-zero."""
+    for m in rom_meta['modules']:
+        if m['name'].lower() in _KERNEL_NAMES:
+            rom_meta['kernel_binary'] = m['name']
+            break
+
+    raw_va = rom_meta.get('_romhdr_va_raw', 0)
+    if not raw_va:
+        return
+
+    romhdr_off = rom_meta.get('_romhdr_off', 0)
+    if romhdr_off and rom_meta['romhdr']:
+        physfirst = int(rom_meta['romhdr']['physfirst'], 16)
+        derived = (physfirst + romhdr_off) & 0xFFFFFFFF
+        if derived != raw_va:
+            print(f"  WARNING: ECEC+4 (0x{raw_va:08X}) != "
+                  f"physfirst+ECEC+8 (0x{derived:08X})")
+
+    rom_meta['romhdr_va'] = f'0x{raw_va:08X}'
+
+
+def _write_rom_meta(out_dir, rom_meta):
+    """Emit rom_meta.json at the top of the extraction directory."""
+    if not rom_meta or not rom_meta.get('romhdr'):
+        return
+    _finalize_rom_meta(rom_meta)
+    out = {k: v for k, v in rom_meta.items() if not k.startswith('_')}
+    path = os.path.join(out_dir, 'rom_meta.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, indent=2)
+    print(f"  rom_meta ({len(out['modules'])} modules, "
+          f"{len(out['files'])} files) -> {path}")
+
+
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def extract_image(bin_path):
-    """Extract a Windows CE / Windows Mobile ROM image."""
+def extract_image(bin_path, heuristic=False):
+    """Extract a Windows CE / Windows Mobile ROM image.
+
+    `heuristic=False` (default): produces ROM-faithful PEs - bytes verbatim
+    from ROM, ImageBase=vbase, IAT bound, RELOCS_STRIPPED set when no reloc
+    table preserved in ROM.
+
+    `heuristic=True`: applies legacy reconstruction passes (synth .reloc,
+    un-rebase to 0x10000000, IAT unbound). Synth has known FPs - not for
+    production use.
+    """
     print(f"Reading {bin_path}...")
     with open(bin_path, 'rb') as f:
         data = f.read()
@@ -235,6 +314,7 @@ def extract_image(bin_path):
 
     is_b000ff = data[:7] == b'B000FF\n'
     attr_log = {}  # CE-style path -> (attrs, filetime); written at the end
+    rom_meta = _new_rom_meta()
 
     if is_b000ff:
         # B000FF container (WM2003 / WM5)
@@ -257,7 +337,8 @@ def extract_image(bin_path):
         print(f"  {len(records)} sections dumped -> {sec_dir}")
 
         print("\nExtracting XIP regions...")
-        extract_xip_regions(flat, base_va, out_dir, attr_log=attr_log)
+        extract_xip_regions(flat, base_va, out_dir, attr_log=attr_log,
+                            heuristic=heuristic, rom_meta=rom_meta)
     else:
         # NB0 flat image (WM6+). Verify ARM branch at offset 0.
         sig = u32(data, 0)
@@ -269,18 +350,22 @@ def extract_image(bin_path):
         has_imgfs = find_imgfs_base(data) != -1
 
         print("\nExtracting XIP regions...")
-        extract_xip_regions(data, 0, out_dir, attr_log=attr_log)
+        extract_xip_regions(data, 0, out_dir, attr_log=attr_log,
+                            heuristic=heuristic, rom_meta=rom_meta)
 
         if has_imgfs:
             print("\nExtracting IMGFS filesystem...")
-            extract_imgfs(data, out_dir, attr_log=attr_log)
+            extract_imgfs(data, out_dir, attr_log=attr_log,
+                          heuristic=heuristic, rom_meta=rom_meta)
 
-    win_dir = os.path.join(out_dir, "Windows")
+    fs_dir = os.path.join(out_dir, "fs")
+    win_dir = os.path.join(fs_dir, "Windows")
     if os.path.isdir(win_dir):
-        _post_process_fs(out_dir, win_dir, attr_log=attr_log)
+        _post_process_fs(fs_dir, win_dir, attr_log=attr_log)
         _post_process_registry(out_dir, win_dir)
 
     _write_attribute_ini(out_dir, attr_log)
+    _write_rom_meta(out_dir, rom_meta)
 
     print(f"\nDone -> {out_dir}")
     return True

@@ -13,12 +13,22 @@ from ..util import align
 CE_TO_PE_DD = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 12, 8: 14}
 
 
-def section_name(flags, rva, ce_dds):
-    """Infer PE section name from o32 flags and data-directory hits."""
+def section_name(flags, rva, ce_dds, vsize=None):
+    """Infer PE section name from o32 flags and data-directory hits.
+
+    When two o32 records share an RVA (a ROM-image overlay layout where
+    a writable RAM-loaded section and a read-only XIP section share a
+    PE-RVA window), require the section's vsize to match the DD's size
+    before claiming the directory's name. Without this, a .data overlay
+    sharing RVA with .pdata would be mis-named .pdata."""
     for idx, (dd_rva, dd_sz) in enumerate(ce_dds):
         if dd_rva == rva and dd_sz > 0:
+            if vsize is not None and vsize != dd_sz:
+                continue
             if idx == 2:
                 return b'.rsrc\x00\x00\x00'
+            if idx == 3:
+                return b'.pdata\x00\x00'
             if idx == 5:
                 return b'.reloc\x00\x00'
     if flags & 0x20:
@@ -35,15 +45,30 @@ def build_pe(objcnt, imgflags, entry_rva, vbase, subsys_maj, subsys_min,
              subsystem=9, sect14_rva=0, sect14_size=0):
     """Assemble a PE32 file from parsed e32rom fields and raw section data.
 
-    Every field comes from the e32rom header - nothing is invented.
-    Fields not present in e32rom are set to 0.
+    Most fields come from the e32rom header. A few that ROMs strip get
+    canonical defaults; some are keyed off `subsys_maj` (the source PE's
+    MajorSubsystemVersion, which the binary itself reports):
+
+      - OSMajor / OSMinor      : 4/0 if sub_maj < 7, else (sub_maj, sub_min)
+      - FileAlignment          : 0x200 if sub_maj < 7, else 0x1000
+      - DllCharacteristics     : NX_COMPAT (0x0100) if sub_maj >= 6, else 0
+      - StackCommit            : 0x1000
+      - HeapReserve / Commit   : 0x100000 / 0x1000
 
     sections: list of dicts {name, vsize, rva, raw_size, flags, data}
     ce_dds:   list of (rva, size) for 9 CE data directories
     """
-    FA = 0x200
     SA = 0x1000
+    FA = 0x1000 if subsys_maj >= 7 else 0x200
     PE_DDS = 16
+
+    os_maj = subsys_maj if subsys_maj >= 7 else 4
+    os_min = subsys_min if subsys_maj >= 7 else 0
+    dll_chars = 0x0100 if subsys_maj >= 6 else 0
+
+    stk_commit = 0x1000
+    heap_reserve = 0x100000
+    heap_commit = 0x1000
 
     dos_sz = 64
     pe_sig_sz = 4
@@ -99,11 +124,15 @@ def build_pe(objcnt, imgflags, entry_rva, vbase, subsys_maj, subsys_min,
     struct.pack_into('<I',  pe, o + 24, base_data)     # +24 BaseOfData
     struct.pack_into('<I',  pe, o + 28, vbase)         # +28 ImageBase
     struct.pack_into('<II', pe, o + 32, SA, FA)        # +32 SectionAlignment, FileAlignment
-    struct.pack_into('<HH', pe, o + 40, subsys_maj, subsys_min)  # +40 OS Major/Minor
-    struct.pack_into('<HH', pe, o + 48, subsys_maj, subsys_min)  # +48 SubsystemMajor/Minor
+    struct.pack_into('<HH', pe, o + 40, os_maj, os_min)         # +40 OS Major/Minor
+    struct.pack_into('<HH', pe, o + 48, subsys_maj, subsys_min) # +48 SubsystemMajor/Minor
     struct.pack_into('<II', pe, o + 56, size_of_image, hdr_aligned)  # +56/60 SizeOfImage / SizeOfHeaders
     struct.pack_into('<H',  pe, o + 68, subsystem)     # +68 Subsystem
+    struct.pack_into('<H',  pe, o + 70, dll_chars)     # +70 DllCharacteristics
     struct.pack_into('<I',  pe, o + 72, stackmax)      # +72 SizeOfStackReserve
+    struct.pack_into('<I',  pe, o + 76, stk_commit)    # +76 SizeOfStackCommit
+    struct.pack_into('<I',  pe, o + 80, heap_reserve)  # +80 SizeOfHeapReserve
+    struct.pack_into('<I',  pe, o + 84, heap_commit)   # +84 SizeOfHeapCommit
     struct.pack_into('<I',  pe, o + 92, PE_DDS)        # +92 NumberOfRvaAndSizes
 
     # Data directories: map CE e32_unit[0..8] to PE DataDirectory[0..15]
