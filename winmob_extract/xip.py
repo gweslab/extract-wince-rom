@@ -89,10 +89,16 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None):
             candidates = [(romhdr_off, load_offset)]
         else:
             # romhdr_phys=0: ROMHDR is reachable only via VA. Try the explicit
-            # base_offset first (WM2003 B000FF), then derive a load base from
-            # romhdr_va's high bits (NB0 PocketPC 2000, where the file is just
-            # the raw ROM mapped at e.g. 0x80000000 with no section header).
+            # base_offset first (WM2003 B000FF), then the kernel-VA mirror of
+            # base_offset (recent romimage emits B000FF with PHYSICAL addresses
+            # while ECEC still carries the VIRTUAL kernel address), then derive
+            # a load base from romhdr_va's high bits (NB0 PocketPC 2000, where
+            # the file is just the raw ROM mapped at e.g. 0x80000000 with no
+            # section header).
             candidates = [(romhdr_va - base_offset, base_offset)]
+            mirror = base_offset | 0x80000000
+            if mirror != base_offset:
+                candidates.append((romhdr_va - mirror, mirror))
             for mask in (0xFF000000, 0xF0000000):
                 cand_load = romhdr_va & mask
                 cand_off = romhdr_va - cand_load
