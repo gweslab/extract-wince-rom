@@ -257,14 +257,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
                 if rom_meta is not None:
                     e32_off = e32_va - load_offset
-                    e32_vsize = (u32(data, e32_off + 0x14)
-                                 if 0 <= e32_off and e32_off + 0x18 <= len(data)
-                                 else fsize)
+                    if 0 <= e32_off and e32_off + 0x18 <= len(data):
+                        e32_vsize = u32(data, e32_off + 0x14)
+                        e32_vbase = u32(data, e32_off + 0x08)
+                    else:
+                        e32_vsize = fsize
+                        e32_vbase = loadoff_va
+                    # CE marks slot-loaded (non-XIP) modules with the
+                    # sentinel ImageBase 0xFFFFF000; XIP modules have a
+                    # real fixed VA. Consumers use the flag to decide
+                    # whether to pre-place the module's bytes at load_va.
                     rom_meta['modules'].append({
                         'name':            fname,
                         'load_va':         _hex(loadoff_va),
                         'vsize':           _hex(e32_vsize),
                         'file_size':       fsize,
+                        'xip':             e32_vbase != 0xFFFFF000,
                         'compressed':      bool(attrs & 0x800),
                         'compressed_size': 0,  # XIP modules aren't compressed
                         'attributes':      _hex(attrs),

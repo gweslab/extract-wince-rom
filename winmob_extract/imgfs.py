@@ -412,11 +412,13 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
                 if rom_meta is not None:
                     attrs = u32(raw, 0x1c)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    e32_vbase = u32(header, 0x08) if header and len(header) >= 12 else 0xFFFFF000
                     rom_meta['modules'].append({
                         'name':            name,
                         'load_va':         '0x00000000',  # IMGFS modules paged-loaded
                         'vsize':           f'0x{file_size:08X}',
                         'file_size':       file_size,
+                        'xip':             e32_vbase != 0xFFFFF000,
                         'compressed':      False,
                         'compressed_size': 0,
                         'attributes':      f'0x{attrs:08X}',
