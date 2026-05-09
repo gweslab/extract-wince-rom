@@ -124,6 +124,32 @@ def parse_rompid_chain(data, load_offset, head_va):
     return chain
 
 
+def parse_copy_table(data, load_offset, copy_va, n_entries):
+    """Parse the ROMHDR copy table at `copy_va` (n_entries x 16 bytes).
+
+    Each COPYentry is { ulSource, ulDest, ulCopyLen, ulDestLen }: copy
+    `ulCopyLen` bytes src->dst, then zero-fill the remaining
+    `ulDestLen - ulCopyLen` bytes at dst+ulCopyLen. The kernel runs this
+    pass early in startup (CE5+ sub_80095584) to materialise .data/.bss
+    in RAM before any /GS-protected code runs.
+    """
+    if not copy_va or not n_entries or n_entries > 4096:
+        return []
+    base_off = copy_va - load_offset
+    if base_off < 0 or base_off + n_entries * 16 > len(data):
+        return []
+    out = []
+    for i in range(n_entries):
+        src, dst, cl, dl = struct.unpack_from('<4I', data, base_off + i * 16)
+        out.append({
+            'src':      _hex(src),
+            'dst':      _hex(dst),
+            'copy_len': _hex(cl),
+            'dest_len': _hex(dl),
+        })
+    return out
+
+
 def _hex(v):
     return f"0x{v & 0xFFFFFFFF:08X}"
 
@@ -208,17 +234,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                 'ulRAMStart':      _hex(hdr['ulRAMStart']),
                 'ulRAMFree_va':    _hex(hdr['ulRAMFree']),
                 'ulRAMEnd':        _hex(hdr['ulRAMEnd']),
+                'ulCopyEntries':   hdr['ulCopyEntries'],
+                'ulCopyOffset':    _hex(hdr['ulCopyOffset']),
                 'ulKernelFlags':   _hex(hdr['ulKernelFlags']),
                 'ulFSRamPercent':  _hex(hdr['ulFSRamPercent']),
                 'ulDrivglobStart': _hex(hdr['ulDrivglobStart']),
                 'ulDrivglobLen':   hdr['ulDrivglobLen'],
                 'usCPUType':       _hex16(hdr['usCPUType']),
                 'usMiscFlags':     _hex16(hdr['usMiscFlags']),
+                'pExtensions':     _hex(hdr['pExtensions']),
                 'ulTrackingStart': _hex(hdr['ulTrackingStart']),
                 'ulTrackingLen':   hdr['ulTrackingLen'],
             }
             rom_meta['rompid'] = parse_rompid_chain(
                 data, load_offset, hdr['pExtensions'])
+            rom_meta['copy_table'] = parse_copy_table(
+                data, load_offset, hdr['ulCopyOffset'], hdr['ulCopyEntries'])
             rom_meta['_romhdr_va_raw'] = ptoc_va
             rom_meta['_romhdr_off'] = romhdr_off_field
 
@@ -278,6 +309,9 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                         'attributes':      _hex(attrs),
                         'filetime_lo':     _hex(ft_lo),
                         'filetime_hi':     _hex(ft_hi),
+                        'e32_offset':      _hex(e32_va),
+                        'o32_offset':      _hex(o32_va),
+                        'name_offset':     _hex(fname_va),
                     })
 
         # Extract files
@@ -318,6 +352,7 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                         'attributes':      _hex(attrs),
                         'filetime_lo':     _hex(ft_lo),
                         'filetime_hi':     _hex(ft_hi),
+                        'name_offset':     _hex(fname_va),
                     })
 
         total_mods += extracted_mods

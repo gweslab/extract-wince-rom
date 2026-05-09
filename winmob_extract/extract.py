@@ -232,6 +232,7 @@ def _new_rom_meta():
         'romhdr_va':        '',
         'romhdr':           None,
         'rompid':           [],
+        'copy_table':       [],
         'modules':          [],
         'files':            [],
         # Internal scratch (stripped before emit):
