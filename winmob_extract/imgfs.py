@@ -11,6 +11,7 @@ import struct
 from .util import u16, u32, safe_filename
 from .compress import try_decompress
 from .pe import reconstruct_pe_imgfs
+from .pe.e32 import parse_e32_base, E32_DD_OFF_WM5
 
 
 # IMGFS constants
@@ -229,7 +230,7 @@ def find_imgfs_base(data):
         pos = idx + 1
 
 
-def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=None):
+def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None):
     """Locate and extract all files from the IMGFS filesystem.
     Handles both FTL-mapped and direct-addressed (NOR) images.
 
@@ -237,10 +238,14 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
               attribute bits and FILETIME for every emitted file/module as
               attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
               Per-IMGFS-dirent: attrs at +0x1c, filetime at +0x20..+0x28.
-    heuristic: forwarded to reconstruct_pe_imgfs.
+    fs_mode:  'raw' | 'heuristic' | 'no'. Skip writing files when 'no';
+              forward heuristic flag to reconstruct_pe_imgfs.
     rom_meta:  optional dict; populated with module/file inventory from
                IMGFS dirents.
     """
+    is_heuristic = (fs_mode == 'heuristic')
+    skip_fs = (fs_mode == 'no')
+
     imgfs_base = find_imgfs_base(data)
     if imgfs_base == -1:
         return
@@ -290,8 +295,10 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
             magic = u32(raw, 0)
             all_entries.append((eo, raw, magic))
 
-    out_dir = os.path.join(output_dir, "fs", "Windows")
-    os.makedirs(out_dir, exist_ok=True)
+    win_dir = os.path.join(output_dir, "fs", "Windows")
+    bad_dir = os.path.join(output_dir, "fs__bad_overlaps")
+    if not skip_fs:
+        os.makedirs(win_dir, exist_ok=True)
 
     files_ok = mods_ok = 0
     files_fail = mods_fail = 0
@@ -315,10 +322,11 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
 
             fdata = _read_index_data(data, translate, indexptr, indexsize, file_size)
             if fdata:
-                path = os.path.join(out_dir, safe_filename(name))
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'wb') as f:
-                    f.write(fdata)
+                if not skip_fs:
+                    path = os.path.join(win_dir, safe_filename(name))
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, 'wb') as f:
+                        f.write(fdata)
                 files_ok += 1
                 if attr_log is not None:
                     attrs = u32(raw, 0x1c)
@@ -327,12 +335,13 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
                 if rom_meta is not None:
                     attrs = u32(raw, 0x1c)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                    # IMGFS files have no TOCentry: no load_va, no
+                    # module-level compressed/compressed_size (per-page
+                    # compression is handled by the IMGFS index walk in
+                    # _read_index_data and not surfaced here).
                     rom_meta['files'].append({
                         'name':            name,
-                        'load_va':         '0x00000000',
                         'real_size':       file_size,
-                        'compressed_size': file_size,
-                        'compressed':      False,
                         'attributes':      f'0x{attrs:08X}',
                         'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
                         'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',
@@ -376,31 +385,40 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
                 j += 1
 
             wrote = False
+            has_shared_rva = False
             if sec_data and header:
-                pe = reconstruct_pe_imgfs(header, sec_data, heuristic=heuristic)
+                pe, has_shared_rva = reconstruct_pe_imgfs(
+                    header, sec_data, heuristic=is_heuristic)
                 if pe:
-                    path = os.path.join(out_dir, safe_filename(name))
-                    with open(path, 'wb') as f:
-                        f.write(pe)
+                    if not skip_fs:
+                        if has_shared_rva:
+                            os.makedirs(bad_dir, exist_ok=True)
+                            path = os.path.join(bad_dir, safe_filename(name))
+                        else:
+                            path = os.path.join(win_dir, safe_filename(name))
+                        with open(path, 'wb') as f:
+                            f.write(pe)
                     wrote = True
                 else:
-                    # Save raw sections as fallback
-                    mdir = os.path.join(out_dir, safe_filename(name) + ".sections")
+                    # Save raw sections as fallback under fs/Windows/
+                    if not skip_fs:
+                        mdir = os.path.join(win_dir, safe_filename(name) + ".sections")
+                        os.makedirs(mdir, exist_ok=True)
+                        with open(os.path.join(mdir, "_header.bin"), 'wb') as f:
+                            f.write(header)
+                        for sn, sd in sec_data.items():
+                            sf = safe_filename(sn) if sn else "unknown"
+                            with open(os.path.join(mdir, sf + ".bin"), 'wb') as f:
+                                f.write(sd)
+                    wrote = True
+            elif sec_data:
+                if not skip_fs:
+                    mdir = os.path.join(win_dir, safe_filename(name) + ".sections")
                     os.makedirs(mdir, exist_ok=True)
-                    with open(os.path.join(mdir, "_header.bin"), 'wb') as f:
-                        f.write(header)
                     for sn, sd in sec_data.items():
                         sf = safe_filename(sn) if sn else "unknown"
                         with open(os.path.join(mdir, sf + ".bin"), 'wb') as f:
                             f.write(sd)
-                    wrote = True
-            elif sec_data:
-                mdir = os.path.join(out_dir, safe_filename(name) + ".sections")
-                os.makedirs(mdir, exist_ok=True)
-                for sn, sd in sec_data.items():
-                    sf = safe_filename(sn) if sn else "unknown"
-                    with open(os.path.join(mdir, sf + ".bin"), 'wb') as f:
-                        f.write(sd)
                 wrote = True
 
             if wrote:
@@ -412,15 +430,30 @@ def extract_imgfs(data, output_dir, attr_log=None, heuristic=False, rom_meta=Non
                 if rom_meta is not None:
                     attrs = u32(raw, 0x1c)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
-                    e32_vbase = u32(header, 0x08) if header and len(header) >= 12 else 0xFFFFF000
+                    # IMGFS modules: no TOCentry (paged-loaded by the
+                    # IMGFS layer), no load_va. e32 fields come from the
+                    # module header blob (extended layout); xip flag is
+                    # the CE sentinel check (0xFFFFF000 = slot-loaded).
+                    info = parse_e32_base(header, 0, E32_DD_OFF_WM5) if header else None
+                    e32_vbase = info['vbase']     if info else 0xFFFFF000
+                    e32_vsize = info['vsize']     if info else 0
+                    entry_rva = info['entry_rva'] if info else 0
+                    subsystem = info['subsystem'] if info else 0
+                    sub_maj   = info['sub_maj']   if info else 0
+                    sub_min   = info['sub_min']   if info else 0
+                    timestamp = info['timestamp'] if info else 0
+                    imgflags  = info['imgflags']  if info else 0
                     rom_meta['modules'].append({
                         'name':            name,
-                        'load_va':         '0x00000000',  # IMGFS modules paged-loaded
-                        'vsize':           f'0x{file_size:08X}',
-                        'file_size':       file_size,
+                        'vsize':           f'0x{e32_vsize:08X}',
+                        'entry_rva':       f'0x{entry_rva:08X}',
+                        'subsystem':       subsystem,
+                        'subsystem_major': sub_maj,
+                        'subsystem_minor': sub_min,
+                        'timestamp':       f'0x{timestamp:08X}',
+                        'imgflags':        f'0x{imgflags:04X}',
                         'xip':             e32_vbase != 0xFFFFF000,
-                        'compressed':      False,
-                        'compressed_size': 0,
+                        'shared_rva':      has_shared_rva,
                         'attributes':      f'0x{attrs:08X}',
                         'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
                         'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',

@@ -148,8 +148,19 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
                        dd_offset=None, heuristic=False):
     """Build PE from XIP module (separate e32/o32 pointers in flat image).
 
-    Default (raw) emits a ROM-faithful PE: bytes verbatim, ImageBase=vbase,
-    IAT bound, RELOCS_STRIPPED set when no reloc table preserved.
+    Returns (pe_data, has_shared_rva). `has_shared_rva` is True when two or
+    more o32_rom records share the same `rva` - CE allows this (a writable
+    RAM-mapped section and a read-only ROM-mapped section overlaid at the
+    same link-time slot, never live simultaneously) but PE format forbids
+    it (section table requires distinct VirtualAddresses). For those
+    modules we skip the RVA-shifting fixup so the PE preserves the
+    original o32.rva values - the PE is technically PE-spec invalid (IDA
+    and Ghidra parse it, the Windows PE loader rejects), but bytes are
+    byte-faithful and the original layout is recoverable. Callers route
+    these to a separate output location.
+
+    Default (raw) emits bytes verbatim, ImageBase=vbase, IAT bound,
+    RELOCS_STRIPPED set when no reloc table preserved.
     `heuristic=True` enables synth .reloc + un-rebase to 0x10000000 + IAT
     unbinding; the synth pass has structural FPs that can corrupt embedded
     constants and is not recommended for production.
@@ -161,10 +172,10 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     else:
         info = parse_e32_base(flat, e32, dd_offset)
     if info is None:
-        return None
+        return None, False
     n = info['objcnt']
     if o32 < 0 or o32 + n * O32_SIZE > len(flat):
-        return None
+        return None, False
 
     vbase = info['vbase']
     ce_dds = list(info['ce_dds'])  # mutable copy
@@ -173,7 +184,14 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     sections, realaddr_map = _read_xip_sections(flat, base_off, o32, n,
                                                 info['ce_dds'], vbase)
     _add_dd_sections(flat, base_off, sections, ce_dds, vbase)
-    _resolve_section_overlaps(sections, ce_dds)
+    rvas = [s['rva'] for s in sections]
+    has_shared_rva = len(set(rvas)) != len(rvas)
+    if not has_shared_rva:
+        _resolve_section_overlaps(sections, ce_dds)
+    else:
+        # Preserve original RVAs; just sort so the section table is in
+        # rva order (PE convention, even when RVAs collide).
+        sections.sort(key=lambda s: s['rva'])
     _patch_realaddr_refs(sections, realaddr_map, vbase)
 
     # Did the ROM preserve the original .reloc bytes?
@@ -199,31 +217,32 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
                        sections, machine, info.get('subsystem', 9),
                        info.get('sect14_rva', 0), info.get('sect14_size', 0))
     if not pe_data:
-        return None
+        return None, has_shared_rva
     # IAT directory metadata (DD[12]) is always populated; only the byte
     # rewrite (bound -> unbound) is gated on heuristic mode.
     pe_data = fix_iat_from_ilt(pe_data, rewrite_iat=heuristic)
     if heuristic:
         pe_data = unrebase_dll(pe_data,
                                reloc_is_ground_truth=reloc_is_ground_truth)
-    return pe_data
+    return pe_data, has_shared_rva
 
 
 def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False):
     """Build PE from IMGFS module (combined e32rom+o32_rom header blob).
 
-    Always uses the extended e32rom layout. Raw/heuristic split same as
-    reconstruct_pe_xip. IMGFS typically preserves source PE .reloc bytes
-    as a stored section, so DD[5] often stays populated even in raw mode.
+    Returns (pe_data, has_shared_rva) - same shared-RVA semantics as
+    reconstruct_pe_xip. Always uses the extended e32rom layout. IMGFS
+    typically preserves source PE .reloc bytes as a stored section, so
+    DD[5] often stays populated even in raw mode.
     """
     if not header_data or len(header_data) < 0x70:
-        return None
+        return None, False
     info = parse_e32_base(header_data, 0, E32_DD_OFF_WM5)
     if info is None:
-        return None
+        return None, False
     n = info['objcnt']
     if len(header_data) < 0x70 + n * O32_SIZE:
-        return None
+        return None, False
 
     ce_dds = list(info['ce_dds'])
     imgflags = info['imgflags']
@@ -238,6 +257,9 @@ def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False):
             name=section_name(sf, sr, ce_dds, vsize=sv),
             vsize=sv, rva=sr, raw_size=len(data) if data else sp,
             flags=sf, data=data))
+
+    rvas = [s['rva'] for s in sections]
+    has_shared_rva = len(set(rvas)) != len(rvas)
 
     reloc_is_ground_truth = _existing_reloc_valid(sections, ce_dds)
 
@@ -254,9 +276,9 @@ def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False):
                        sect14_rva=info.get('sect14_rva', 0),
                        sect14_size=info.get('sect14_size', 0))
     if not pe_data:
-        return None
+        return None, has_shared_rva
     pe_data = fix_iat_from_ilt(pe_data, rewrite_iat=heuristic)
     if heuristic:
         pe_data = unrebase_dll(pe_data,
                                reloc_is_ground_truth=reloc_is_ground_truth)
-    return pe_data
+    return pe_data, has_shared_rva

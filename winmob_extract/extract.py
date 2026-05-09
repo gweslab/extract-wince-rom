@@ -15,7 +15,7 @@ import shutil
 from .util import u32
 from .b000ff import parse_b000ff
 from .xip import extract_xip_regions
-from .imgfs import IMGFS_UUID, IMGFS_DIRENT_SIZE, find_imgfs_base, extract_imgfs
+from .imgfs import IMGFS_UUID, find_imgfs_base, extract_imgfs
 from .registry import CE_FDF_MAGIC, parse_fdf_registry, fdf_to_reg_text
 
 
@@ -227,7 +227,6 @@ def _write_attribute_ini(out_dir, attr_log):
 def _new_rom_meta():
     """Initial empty rom_meta state. Populated as extraction progresses."""
     return {
-        'rom_meta_version': 1,
         'kernel_binary':    '',
         'romhdr_va':        '',
         'romhdr':           None,
@@ -287,19 +286,155 @@ def _write_rom_meta(out_dir, rom_meta):
           f"{len(out['files'])} files) -> {path}")
 
 
+# ── Sections/ emission ──────────────────────────────────────────────────────
+
+def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
+                   b000ff_data=None, b000ff_records=None,
+                   nb0_data=None, nb0_load_offset=None):
+    """Write Sections/ files. `sections_mode` is 'full' or 'only-overlapping'.
+
+    full: B000FF -> one file per ROM section (preserved native layout);
+          NB0   -> one file with the whole flat image.
+    only-overlapping: emit only the byte ranges consumers need without
+          fs/ - shared-RVA module sections + the IMGFS region.
+    """
+    sec_dir = os.path.join(out_dir, "Sections")
+    os.makedirs(sec_dir, exist_ok=True)
+
+    # B000FF records sometimes carry physical VAs (no high bit) while ECEC
+    # / o32 carry kernel-VA (high bit set). Normalize record bases to
+    # kernel-VA using the load_offset that extract_xip_regions discovered
+    # from ECEC, so file names and shared-RVA dataptr intersections both
+    # operate in the same VA space.
+    va_shift = 0
+    if fmt == 'b000ff' and b000ff_records:
+        load_offset = rom_meta.get('_load_offset', 0)
+        flat_base_va = min(r[0] for r in b000ff_records)
+        va_shift = load_offset - flat_base_va
+
+    if sections_mode == 'full':
+        if fmt == 'b000ff':
+            for i, (sec_base, sec_size, file_off) in enumerate(b000ff_records):
+                kva = sec_base + va_shift
+                path = os.path.join(
+                    sec_dir, f"{i:02d}_0x{kva:08X}_{sec_size}.bin")
+                with open(path, 'wb') as f:
+                    f.write(b000ff_data[file_off:file_off + sec_size])
+            print(f"  {len(b000ff_records)} sections dumped -> {sec_dir}")
+        else:  # nb0
+            path = os.path.join(
+                sec_dir, f"00_0x{nb0_load_offset:08X}_{len(nb0_data)}.bin")
+            with open(path, 'wb') as f:
+                f.write(nb0_data)
+            print(f"  1 section dumped -> {sec_dir}")
+        return
+
+    # 'only-overlapping'
+    needed = []
+    for mod in rom_meta.get('modules', []):
+        if not mod.get('shared_rva'):
+            continue
+        for sec in mod.get('sections', []):
+            dataptr = int(sec['dataptr'], 16)
+            psize = int(sec['psize'], 16)
+            if dataptr and psize:
+                needed.append((dataptr, dataptr + psize))
+
+    # IMGFS region (in kernel-VA space)
+    if fmt == 'b000ff':
+        # Find IMGFS by scanning each record's bytes for the UUID, then
+        # include that record + every subsequent record (IMGFS sits at the
+        # tail of B000FF ROMs in practice).
+        imgfs_record_idx = None
+        for i, (sec_base, sec_size, file_off) in enumerate(b000ff_records):
+            sec_bytes = b000ff_data[file_off:file_off + sec_size]
+            if IMGFS_UUID in sec_bytes:
+                imgfs_record_idx = i
+                break
+        if imgfs_record_idx is not None:
+            for sec_base, sec_size, file_off in b000ff_records[imgfs_record_idx:]:
+                kva = sec_base + va_shift
+                needed.append((kva, kva + sec_size))
+    else:  # nb0
+        imgfs_off = find_imgfs_base(nb0_data)
+        if imgfs_off >= 0:
+            imgfs_va = nb0_load_offset + imgfs_off
+            imgfs_end_va = nb0_load_offset + len(nb0_data)
+            needed.append((imgfs_va, imgfs_end_va))
+
+    if not needed:
+        print(f"  Sections/ empty (no shared-RVA modules, no IMGFS)")
+        return
+
+    needed.sort()
+    merged = [list(needed[0])]
+    for s, e in needed[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    written = 0
+    for s, e in merged:
+        if fmt == 'b000ff':
+            for sec_base, sec_size, file_off in b000ff_records:
+                kva = sec_base + va_shift
+                sec_end_kva = kva + sec_size
+                ov_start = max(s, kva)
+                ov_end = min(e, sec_end_kva)
+                if ov_end > ov_start:
+                    length = ov_end - ov_start
+                    src_off_start = file_off + (ov_start - kva)
+                    path = os.path.join(
+                        sec_dir,
+                        f"{written:02d}_0x{ov_start:08X}_{length}.bin")
+                    with open(path, 'wb') as f:
+                        f.write(b000ff_data[src_off_start:src_off_start + length])
+                    written += 1
+        else:  # nb0
+            src_off_start = s - nb0_load_offset
+            if src_off_start < 0 or src_off_start >= len(nb0_data):
+                continue
+            length = min(e - nb0_load_offset, len(nb0_data)) - src_off_start
+            if length <= 0:
+                continue
+            path = os.path.join(
+                sec_dir, f"{written:02d}_0x{s:08X}_{length}.bin")
+            with open(path, 'wb') as f:
+                f.write(nb0_data[src_off_start:src_off_start + length])
+            written += 1
+    print(f"  {written} sections dumped -> {sec_dir}")
+
+
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def extract_image(bin_path, heuristic=False):
+def extract_image(bin_path, fs_mode='raw', sections_mode='only-overlapping'):
     """Extract a Windows CE / Windows Mobile ROM image.
 
-    `heuristic=False` (default): produces ROM-faithful PEs - bytes verbatim
-    from ROM, ImageBase=vbase, IAT bound, RELOCS_STRIPPED set when no reloc
-    table preserved in ROM.
+    fs_mode controls filesystem reconstruction:
+      'raw' (default): per-module PE with bytes verbatim from ROM at
+                       link-time RVAs. Modules with shared-RVA sections
+                       (CE allows two o32 records at the same rva) go
+                       to <out>/fs__bad_overlaps/ with original RVAs
+                       preserved (PE-spec invalid; IDA/Ghidra parse fine).
+                       Other modules go to <out>/fs/Windows/.
+      'heuristic':     same plus synth .reloc / un-rebase / IAT
+                       unbinding passes. Synth has known FPs - not for
+                       production use.
+      'no':            skip <out>/fs/, <out>/fs__bad_overlaps/,
+                       <out>/Registry/, <out>/attributes.ini. Output is
+                       <out>/rom_meta.json + <out>/Sections/ only.
 
-    `heuristic=True`: applies legacy reconstruction passes (synth .reloc,
-    un-rebase to 0x10000000, IAT unbound). Synth has known FPs - not for
-    production use.
+    sections_mode controls the Sections/ folder:
+      'only-overlapping' (default): emit only byte ranges consumers need
+                                    without fs/ - shared-RVA module
+                                    section data + the IMGFS region
+                                    (when present).
+      'full':                       B000FF: one file per ROM section
+                                    (native layout). NB0: one file with
+                                    the entire flat image.
     """
+    skip_fs = (fs_mode == 'no')
     print(f"Reading {bin_path}...")
     with open(bin_path, 'rb') as f:
         data = f.read()
@@ -325,21 +460,13 @@ def extract_image(bin_path, heuristic=False):
             print("ERROR: Failed to parse B000FF container")
             return False
 
-        # Dump each section verbatim under <out>/Sections/. Lets the user
-        # recover bootloader/eboot images that have no ECEC marker, and gives
-        # ground truth for kernel ROMs alongside the PE-reconstructed output.
-        sec_dir = os.path.join(out_dir, "Sections")
-        os.makedirs(sec_dir, exist_ok=True)
-        for i, (sec_base, sec_size, file_off) in enumerate(records):
-            sec_path = os.path.join(
-                sec_dir, f"{i:02d}_0x{sec_base:08X}_{sec_size}.bin")
-            with open(sec_path, 'wb') as f:
-                f.write(data[file_off:file_off + sec_size])
-        print(f"  {len(records)} sections dumped -> {sec_dir}")
-
         print("\nExtracting XIP regions...")
         extract_xip_regions(flat, base_va, out_dir, attr_log=attr_log,
-                            heuristic=heuristic, rom_meta=rom_meta)
+                            fs_mode=fs_mode, rom_meta=rom_meta)
+
+        print(f"\nWriting Sections/ ({sections_mode})...")
+        _emit_sections(out_dir, sections_mode, rom_meta, fmt='b000ff',
+                       b000ff_data=data, b000ff_records=records)
     else:
         # NB0 flat image (WM6+). Verify ARM branch at offset 0.
         sig = u32(data, 0)
@@ -352,20 +479,27 @@ def extract_image(bin_path, heuristic=False):
 
         print("\nExtracting XIP regions...")
         extract_xip_regions(data, 0, out_dir, attr_log=attr_log,
-                            heuristic=heuristic, rom_meta=rom_meta)
+                            fs_mode=fs_mode, rom_meta=rom_meta)
 
         if has_imgfs:
             print("\nExtracting IMGFS filesystem...")
             extract_imgfs(data, out_dir, attr_log=attr_log,
-                          heuristic=heuristic, rom_meta=rom_meta)
+                          fs_mode=fs_mode, rom_meta=rom_meta)
+
+        load_offset = rom_meta.get('_load_offset')
+        if load_offset is not None:
+            print(f"\nWriting Sections/ ({sections_mode})...")
+            _emit_sections(out_dir, sections_mode, rom_meta, fmt='nb0',
+                           nb0_data=data, nb0_load_offset=load_offset)
 
     fs_dir = os.path.join(out_dir, "fs")
     win_dir = os.path.join(fs_dir, "Windows")
-    if os.path.isdir(win_dir):
+    if not skip_fs and os.path.isdir(win_dir):
         _post_process_fs(fs_dir, win_dir, attr_log=attr_log)
         _post_process_registry(out_dir, win_dir)
 
-    _write_attribute_ini(out_dir, attr_log)
+    if not skip_fs:
+        _write_attribute_ini(out_dir, attr_log)
     _write_rom_meta(out_dir, rom_meta)
 
     print(f"\nDone -> {out_dir}")

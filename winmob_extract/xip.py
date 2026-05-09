@@ -15,6 +15,7 @@ from .util import (u32, u16, read_ascii, safe_filename,
                    ROMHDR_SIZE, TOCENTRY_SIZE, FILEENTRY_SIZE)
 from .compress import ce_rom_decompress
 from .pe import reconstruct_pe_xip
+from .pe.e32 import parse_e32_auto
 
 
 def find_all_ecec(data, limit=None):
@@ -124,6 +125,48 @@ def parse_rompid_chain(data, load_offset, head_va):
     return chain
 
 
+def parse_e32_header(data, load_offset, e32_va):
+    """Read e32_rom fields needed for rom_meta module entries: image size,
+    entry RVA, image base, subsystem, subsystem version, timestamp, image
+    flags, object count. Tries the extended layout first (4-byte timestamp
+    field at +0x20 + DD array at +0x24) and falls back to legacy (DD array
+    at +0x20, no timestamp field) when extended fails validity checks.
+    Returns dict or None if the e32 header isn't readable.
+    """
+    info, _ = parse_e32_auto(data, e32_va - load_offset)
+    return info
+
+
+def parse_section_records(data, load_offset, o32_va, objcnt):
+    """Read `objcnt` o32_rom records (24 bytes each) starting at VA `o32_va`.
+
+    Each record exposes {vsize, rva, psize, dataptr, realaddr, flags}. CE
+    splits between `rva` (link-time RVA) and `realaddr` (runtime VA the
+    kernel maps the section to via MMU): they differ for sections that
+    live in ROM but are mapped to RAM at runtime, and for sections whose
+    runtime address differs from `vbase + rva`. PE reconstruction
+    flattens both into the on-disk PE, so the original split is only
+    recoverable from these records.
+    """
+    if not o32_va or not objcnt or objcnt > 64:
+        return []
+    base_off = o32_va - load_offset
+    if base_off < 0 or base_off + objcnt * 24 > len(data):
+        return []
+    out = []
+    for s in range(objcnt):
+        sv, sr, sp, sd, sa, sf = struct.unpack_from('<6I', data, base_off + s * 24)
+        out.append({
+            'vsize':    _hex(sv),
+            'rva':      _hex(sr),
+            'psize':    _hex(sp),
+            'dataptr':  _hex(sd),
+            'realaddr': _hex(sa),
+            'flags':    _hex(sf),
+        })
+    return out
+
+
 def parse_copy_table(data, load_offset, copy_va, n_entries):
     """Parse the ROMHDR copy table at `copy_va` (n_entries x 16 bytes).
 
@@ -159,7 +202,7 @@ def _hex16(v):
 
 
 def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
-                        heuristic=False, rom_meta=None):
+                        fs_mode='raw', rom_meta=None):
     """Find and extract all XIP regions from a flat image.
 
     data:        flat image bytes
@@ -170,11 +213,16 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
     attr_log:    optional dict; if provided, records the original CE file
                  attribute bits and FILETIME for every emitted module/file as
                  attr_log['\\Windows\\<name>'] = (attrs_int, filetime_u64).
-    heuristic:   forwarded to reconstruct_pe_xip; controls whether the
-                 legacy synth/un-rebase passes run. Default off (raw mode).
+    fs_mode:     'raw' (default) | 'heuristic' | 'no'.
+                 'raw': PE reconstruction with bytes verbatim, no synth.
+                 'heuristic': adds .reloc synth + un-rebase + IAT unbinding.
+                 'no': skip writing PE / file output entirely; rom_meta still
+                       populated.
     rom_meta:    optional dict; if provided, populated with ROMHDR fields,
                  module/file inventory, and ptoc/rompid metadata.
     """
+    is_heuristic = (fs_mode == 'heuristic')
+    skip_fs = (fs_mode == 'no')
     ecec_limit = min(len(data), 0x800000)  # ECEC should be in first 8 MB
     ececs = find_all_ecec(data, limit=ecec_limit)
 
@@ -252,12 +300,15 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                 data, load_offset, hdr['ulCopyOffset'], hdr['ulCopyEntries'])
             rom_meta['_romhdr_va_raw'] = ptoc_va
             rom_meta['_romhdr_off'] = romhdr_off_field
+            rom_meta['_load_offset'] = load_offset
 
         if nummods == 0 and numfiles == 0:
             continue
 
-        out_dir = os.path.join(output_dir, "fs", "Windows")
-        os.makedirs(out_dir, exist_ok=True)
+        win_dir = os.path.join(output_dir, "fs", "Windows")
+        bad_dir = os.path.join(output_dir, "fs__bad_overlaps")
+        if not skip_fs:
+            os.makedirs(win_dir, exist_ok=True)
 
         toc_start = romhdr_off + ROMHDR_SIZE
         files_start = toc_start + nummods * TOCENTRY_SIZE
@@ -277,23 +328,32 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             else:
                 fname = f"mod_{i}"
 
-            pe_data = reconstruct_pe_xip(data, load_offset, e32_va, o32_va,
-                                         machine, heuristic=heuristic)
+            pe_data, has_shared_rva = reconstruct_pe_xip(
+                data, load_offset, e32_va, o32_va,
+                machine, heuristic=is_heuristic)
             if pe_data:
-                outpath = os.path.join(out_dir, safe_filename(fname))
-                with open(outpath, 'wb') as f:
-                    f.write(pe_data)
+                if not skip_fs:
+                    if has_shared_rva:
+                        os.makedirs(bad_dir, exist_ok=True)
+                        outpath = os.path.join(bad_dir, safe_filename(fname))
+                    else:
+                        outpath = os.path.join(win_dir, safe_filename(fname))
+                    with open(outpath, 'wb') as f:
+                        f.write(pe_data)
                 extracted_mods += 1
                 if attr_log is not None:
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
                 if rom_meta is not None:
-                    e32_off = e32_va - load_offset
-                    if 0 <= e32_off and e32_off + 0x18 <= len(data):
-                        e32_vsize = u32(data, e32_off + 0x14)
-                        e32_vbase = u32(data, e32_off + 0x08)
-                    else:
-                        e32_vsize = fsize
-                        e32_vbase = loadoff_va
+                    e32_info = parse_e32_header(data, load_offset, e32_va)
+                    objcnt    = e32_info['objcnt']    if e32_info else 0
+                    e32_vsize = e32_info['vsize']     if e32_info else fsize
+                    e32_vbase = e32_info['vbase']     if e32_info else loadoff_va
+                    entry_rva = e32_info['entry_rva'] if e32_info else 0
+                    subsystem = e32_info['subsystem'] if e32_info else 0
+                    sub_maj   = e32_info['sub_maj']   if e32_info else 0
+                    sub_min   = e32_info['sub_min']   if e32_info else 0
+                    timestamp = e32_info['timestamp'] if e32_info else 0
+                    imgflags  = e32_info['imgflags']  if e32_info else 0
                     # CE marks slot-loaded (non-XIP) modules with the
                     # sentinel ImageBase 0xFFFFF000; XIP modules have a
                     # real fixed VA. Consumers use the flag to decide
@@ -302,16 +362,24 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                         'name':            fname,
                         'load_va':         _hex(loadoff_va),
                         'vsize':           _hex(e32_vsize),
+                        'entry_rva':       _hex(entry_rva),
+                        'subsystem':       subsystem,
+                        'subsystem_major': sub_maj,
+                        'subsystem_minor': sub_min,
+                        'timestamp':       _hex(timestamp),
+                        'imgflags':        _hex16(imgflags),
                         'file_size':       fsize,
                         'xip':             e32_vbase != 0xFFFFF000,
                         'compressed':      bool(attrs & 0x800),
-                        'compressed_size': 0,  # XIP modules aren't compressed
+                        'shared_rva':      has_shared_rva,
                         'attributes':      _hex(attrs),
                         'filetime_lo':     _hex(ft_lo),
                         'filetime_hi':     _hex(ft_hi),
                         'e32_offset':      _hex(e32_va),
                         'o32_offset':      _hex(o32_va),
                         'name_offset':     _hex(fname_va),
+                        'sections':        parse_section_records(
+                                               data, load_offset, o32_va, objcnt),
                     })
 
         # Extract files
@@ -336,9 +404,10 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                     dec = ce_rom_decompress(raw, real_size)
                     if dec and len(dec) == real_size:
                         raw = dec
-                outpath = os.path.join(out_dir, safe_filename(fname))
-                with open(outpath, 'wb') as f:
-                    f.write(raw)
+                if not skip_fs:
+                    outpath = os.path.join(win_dir, safe_filename(fname))
+                    with open(outpath, 'wb') as f:
+                        f.write(raw)
                 extracted_files += 1
                 if attr_log is not None:
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
