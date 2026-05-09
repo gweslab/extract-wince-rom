@@ -22,7 +22,7 @@ Targets Microsoft Device Emulator images and OEM dumps from Pocket PC 2000 throu
 - **Import table repair** (heuristic mode only): overwrites ROM-baked IAT entries with original ILT ordinal/name hints
 - **Directory structure** from `initflashfiles.dat` (WM5+) or `initobj.dat` (CE3 / WM2003)
 - **Registry** extraction: `.rgu` → UTF-8 `.reg` (WM5+), `.hv` preserved verbatim (WM5+), and `default.fdf` binary boot registry → `.reg` (CE3 / WM2003)
-- **`rom_meta.json`** with ROMHDR fields (including `ulCopyEntries`/`ulCopyOffset`/`pExtensions`), parsed `copy_table[]` (`{src, dst, copy_len, dest_len}` per entry), ROMPID extension chain, module/file inventory, per-module `e32_rom` fields (`vbase`, `vsize`, `entry_rva`, `stack_max`, `subsystem(+major/minor)`, `timestamp`, `imgflags`, `sect14_rva/size`, `data_dirs[18]`) plus original `o32_rom` records (`sections[]`), and `romhdr_va` (the value at `physfirst+0x44` per `romldr.h`'s `ROM_TOC_POINTER_OFFSET`, populated across CE3..CE7)
+- **`rom_meta.json`** carries what isn't recoverable from a per-file PE: ROMHDR fields (including `ulCopyEntries`/`ulCopyOffset`/`pExtensions`), parsed `copy_table[]` (`{src, dst, copy_len, dest_len}` per entry), ROMPID extension chain, module/file inventory with TOCentry pointers (`e32_offset`, `o32_offset`, `name_offset`, `load_va`), original `o32_rom` records per module (`sections[]` — carries `realaddr` and `dataptr` PE format can't represent), and `romhdr_va`. The PE container in `fs/Windows/<name>` remains the source for `e32_rom` fields the PE already carries (`vbase`, `vsize`, `entry_rva`, `stack_max`, subsystem, timestamp, characteristics, data directories) — those are duplicated into `rom_meta` **only for shared-RVA modules**, where the PE in `_DO_NOT_USE_invalid_pes/` is PE-spec invalid and can't be relied on.
 
 ## Modes
 
@@ -66,9 +66,13 @@ Output goes to a directory named after the image (e.g. `WM5_PPC_USA/`):
   attributes.ini       CE filesystem attribute bits + FILETIME per path
                        (skipped when --fs=no)
   rom_meta.json        ROMHDR / TOC / FILES / ROMPID / copy_table /
-                       per-module e32_rom fields + sections[] (original
-                       o32_rom records: vsize, rva, psize, dataptr,
-                       realaddr, flags)
+                       per-module sections[] (original o32_rom records:
+                       vsize, rva, psize, dataptr, realaddr, flags).
+                       Per-module e32_rom fields (vbase, vsize, entry_rva,
+                       stack_max, subsystem, timestamp, imgflags,
+                       sect14_*, data_dirs) appear only on shared_rva
+                       modules; for legit modules the PE in fs/Windows
+                       carries them.
 ```
 
 ## Tested images

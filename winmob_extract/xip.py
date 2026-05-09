@@ -345,39 +345,21 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
                 if rom_meta is not None:
                     e32_info = parse_e32_header(data, load_offset, e32_va)
-                    objcnt      = e32_info['objcnt']      if e32_info else 0
-                    e32_vsize   = e32_info['vsize']       if e32_info else fsize
-                    e32_vbase   = e32_info['vbase']       if e32_info else loadoff_va
-                    entry_rva   = e32_info['entry_rva']   if e32_info else 0
-                    subsystem   = e32_info['subsystem']   if e32_info else 0
-                    sub_maj     = e32_info['sub_maj']     if e32_info else 0
-                    sub_min     = e32_info['sub_min']     if e32_info else 0
-                    timestamp   = e32_info['timestamp']   if e32_info else 0
-                    imgflags    = e32_info['imgflags']    if e32_info else 0
-                    stack_max   = e32_info['stackmax']    if e32_info else 0
-                    sect14_rva  = e32_info['sect14_rva']  if e32_info else 0
-                    sect14_size = e32_info['sect14_size'] if e32_info else 0
-                    ce_dds      = e32_info['ce_dds']      if e32_info else []
-                    data_dirs   = [_hex(v) for pair in ce_dds for v in pair]
-                    # CE marks slot-loaded (non-XIP) modules with the
-                    # sentinel ImageBase 0xFFFFF000; XIP modules have a
-                    # real fixed VA. Consumers use the flag to decide
-                    # whether to pre-place the module's bytes at load_va.
-                    rom_meta['modules'].append({
+                    objcnt    = e32_info['objcnt'] if e32_info else 0
+                    e32_vbase = e32_info['vbase']  if e32_info else loadoff_va
+                    # Per-module entry. e32_rom fields that the PE
+                    # container already carries (vbase, vsize, entry_rva,
+                    # stack_max, subsystem*, timestamp, imgflags,
+                    # sect14_*, data_dirs) are emitted ONLY for shared_rva
+                    # modules - those PEs are PE-spec invalid and live in
+                    # _DO_NOT_USE_invalid_pes/, so consumers can't trust
+                    # the OptionalHeader. For legit modules the PE in
+                    # fs/Windows is the source; metadata carries only
+                    # what PE can't (TOCentry pointers, dataptr/realaddr
+                    # in sections[], routing flags).
+                    entry = {
                         'name':            fname,
                         'load_va':         _hex(loadoff_va),
-                        'vbase':           _hex(e32_vbase),
-                        'vsize':           _hex(e32_vsize),
-                        'entry_rva':       _hex(entry_rva),
-                        'stack_max':       _hex(stack_max),
-                        'subsystem':       subsystem,
-                        'subsystem_major': sub_maj,
-                        'subsystem_minor': sub_min,
-                        'timestamp':       _hex(timestamp),
-                        'imgflags':        _hex16(imgflags),
-                        'sect14_rva':      _hex(sect14_rva),
-                        'sect14_size':     _hex(sect14_size),
-                        'data_dirs':       data_dirs,
                         'file_size':       fsize,
                         'xip':             e32_vbase != 0xFFFFF000,
                         'compressed':      bool(attrs & 0x800),
@@ -390,7 +372,25 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                         'name_offset':     _hex(fname_va),
                         'sections':        parse_section_records(
                                                data, load_offset, o32_va, objcnt),
-                    })
+                    }
+                    if has_shared_rva and e32_info:
+                        ce_dds = e32_info['ce_dds']
+                        entry.update({
+                            'vbase':           _hex(e32_info['vbase']),
+                            'vsize':           _hex(e32_info['vsize']),
+                            'entry_rva':       _hex(e32_info['entry_rva']),
+                            'stack_max':       _hex(e32_info['stackmax']),
+                            'subsystem':       e32_info['subsystem'],
+                            'subsystem_major': e32_info['sub_maj'],
+                            'subsystem_minor': e32_info['sub_min'],
+                            'timestamp':       _hex(e32_info['timestamp']),
+                            'imgflags':        _hex16(e32_info['imgflags']),
+                            'sect14_rva':      _hex(e32_info['sect14_rva']),
+                            'sect14_size':     _hex(e32_info['sect14_size']),
+                            'data_dirs':       [_hex(v) for pair in ce_dds
+                                                for v in pair],
+                        })
+                    rom_meta['modules'].append(entry)
 
         # Extract files
         extracted_files = 0

@@ -434,40 +434,40 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
                     # IMGFS layer), no load_va. e32 fields come from the
                     # module header blob (extended layout); xip flag is
                     # the CE sentinel check (0xFFFFF000 = slot-loaded).
+                    # Same PE-as-unit principle as XIP modules: e32_rom
+                    # fields the PE already carries are emitted only for
+                    # shared_rva modules (their PE is in
+                    # _DO_NOT_USE_invalid_pes/, untrustable). Legit IMGFS
+                    # modules have their PE in fs/Windows; consumer reads
+                    # the OptionalHeader directly.
                     info = parse_e32_base(header, 0, E32_DD_OFF_WM5) if header else None
-                    e32_vbase   = info['vbase']       if info else 0xFFFFF000
-                    e32_vsize   = info['vsize']       if info else 0
-                    entry_rva   = info['entry_rva']   if info else 0
-                    subsystem   = info['subsystem']   if info else 0
-                    sub_maj     = info['sub_maj']     if info else 0
-                    sub_min     = info['sub_min']     if info else 0
-                    timestamp   = info['timestamp']   if info else 0
-                    imgflags    = info['imgflags']    if info else 0
-                    stack_max   = info['stackmax']    if info else 0
-                    sect14_rva  = info['sect14_rva']  if info else 0
-                    sect14_size = info['sect14_size'] if info else 0
-                    ce_dds      = info['ce_dds']      if info else []
-                    data_dirs   = [f'0x{v:08X}' for pair in ce_dds for v in pair]
-                    rom_meta['modules'].append({
+                    e32_vbase = info['vbase'] if info else 0xFFFFF000
+                    entry = {
                         'name':            name,
-                        'vbase':           f'0x{e32_vbase:08X}',
-                        'vsize':           f'0x{e32_vsize:08X}',
-                        'entry_rva':       f'0x{entry_rva:08X}',
-                        'stack_max':       f'0x{stack_max:08X}',
-                        'subsystem':       subsystem,
-                        'subsystem_major': sub_maj,
-                        'subsystem_minor': sub_min,
-                        'timestamp':       f'0x{timestamp:08X}',
-                        'imgflags':        f'0x{imgflags:04X}',
-                        'sect14_rva':      f'0x{sect14_rva:08X}',
-                        'sect14_size':     f'0x{sect14_size:08X}',
-                        'data_dirs':       data_dirs,
                         'xip':             e32_vbase != 0xFFFFF000,
                         'shared_rva':      has_shared_rva,
                         'attributes':      f'0x{attrs:08X}',
                         'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
                         'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',
-                    })
+                    }
+                    if has_shared_rva and info:
+                        ce_dds = info['ce_dds']
+                        entry.update({
+                            'vbase':           f'0x{info["vbase"]:08X}',
+                            'vsize':           f'0x{info["vsize"]:08X}',
+                            'entry_rva':       f'0x{info["entry_rva"]:08X}',
+                            'stack_max':       f'0x{info["stackmax"]:08X}',
+                            'subsystem':       info['subsystem'],
+                            'subsystem_major': info['sub_maj'],
+                            'subsystem_minor': info['sub_min'],
+                            'timestamp':       f'0x{info["timestamp"]:08X}',
+                            'imgflags':        f'0x{info["imgflags"]:04X}',
+                            'sect14_rva':      f'0x{info["sect14_rva"]:08X}',
+                            'sect14_size':     f'0x{info["sect14_size"]:08X}',
+                            'data_dirs':       [f'0x{v:08X}' for pair in ce_dds
+                                                for v in pair],
+                        })
+                    rom_meta['modules'].append(entry)
             else:
                 mods_fail += 1
 
