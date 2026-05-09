@@ -20,7 +20,7 @@ Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0
              writable RAM-mapped section and a read-only ROM-mapped
              section overlaid at the same link-time slot, never live
              simultaneously, but PE format requires distinct
-             VirtualAddresses) are routed to <out>/fs__bad_overlaps/
+             VirtualAddresses) are routed to <out>/_DO_NOT_USE_invalid_pes/
              with original RVAs preserved. PE there is technically
              PE-spec invalid (Windows PE loader rejects); IDA, Ghidra
              and objdump parse it. Section runtime layout (realaddr)
@@ -34,7 +34,7 @@ Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0
              consumers re-relocate. Not recommended for production.
 
   no         Skip filesystem reconstruction. Output is rom_meta.json
-             + Sections/ only - no fs/, no fs__bad_overlaps/, no
+             + Sections/ only - no fs/, no _DO_NOT_USE_invalid_pes/, no
              Registry/, no attributes.ini.
 
 --sections=MODE controls the Sections/ folder (default:

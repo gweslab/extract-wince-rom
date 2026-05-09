@@ -296,7 +296,7 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
             all_entries.append((eo, raw, magic))
 
     win_dir = os.path.join(output_dir, "fs", "Windows")
-    bad_dir = os.path.join(output_dir, "fs__bad_overlaps")
+    bad_dir = os.path.join(output_dir, "_DO_NOT_USE_invalid_pes")
     if not skip_fs:
         os.makedirs(win_dir, exist_ok=True)
 
@@ -435,23 +435,33 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
                     # module header blob (extended layout); xip flag is
                     # the CE sentinel check (0xFFFFF000 = slot-loaded).
                     info = parse_e32_base(header, 0, E32_DD_OFF_WM5) if header else None
-                    e32_vbase = info['vbase']     if info else 0xFFFFF000
-                    e32_vsize = info['vsize']     if info else 0
-                    entry_rva = info['entry_rva'] if info else 0
-                    subsystem = info['subsystem'] if info else 0
-                    sub_maj   = info['sub_maj']   if info else 0
-                    sub_min   = info['sub_min']   if info else 0
-                    timestamp = info['timestamp'] if info else 0
-                    imgflags  = info['imgflags']  if info else 0
+                    e32_vbase   = info['vbase']       if info else 0xFFFFF000
+                    e32_vsize   = info['vsize']       if info else 0
+                    entry_rva   = info['entry_rva']   if info else 0
+                    subsystem   = info['subsystem']   if info else 0
+                    sub_maj     = info['sub_maj']     if info else 0
+                    sub_min     = info['sub_min']     if info else 0
+                    timestamp   = info['timestamp']   if info else 0
+                    imgflags    = info['imgflags']    if info else 0
+                    stack_max   = info['stackmax']    if info else 0
+                    sect14_rva  = info['sect14_rva']  if info else 0
+                    sect14_size = info['sect14_size'] if info else 0
+                    ce_dds      = info['ce_dds']      if info else []
+                    data_dirs   = [f'0x{v:08X}' for pair in ce_dds for v in pair]
                     rom_meta['modules'].append({
                         'name':            name,
+                        'vbase':           f'0x{e32_vbase:08X}',
                         'vsize':           f'0x{e32_vsize:08X}',
                         'entry_rva':       f'0x{entry_rva:08X}',
+                        'stack_max':       f'0x{stack_max:08X}',
                         'subsystem':       subsystem,
                         'subsystem_major': sub_maj,
                         'subsystem_minor': sub_min,
                         'timestamp':       f'0x{timestamp:08X}',
                         'imgflags':        f'0x{imgflags:04X}',
+                        'sect14_rva':      f'0x{sect14_rva:08X}',
+                        'sect14_size':     f'0x{sect14_size:08X}',
+                        'data_dirs':       data_dirs,
                         'xip':             e32_vbase != 0xFFFFF000,
                         'shared_rva':      has_shared_rva,
                         'attributes':      f'0x{attrs:08X}',

@@ -415,13 +415,13 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='only-overlapping'):
       'raw' (default): per-module PE with bytes verbatim from ROM at
                        link-time RVAs. Modules with shared-RVA sections
                        (CE allows two o32 records at the same rva) go
-                       to <out>/fs__bad_overlaps/ with original RVAs
+                       to <out>/_DO_NOT_USE_invalid_pes/ with original RVAs
                        preserved (PE-spec invalid; IDA/Ghidra parse fine).
                        Other modules go to <out>/fs/Windows/.
       'heuristic':     same plus synth .reloc / un-rebase / IAT
                        unbinding passes. Synth has known FPs - not for
                        production use.
-      'no':            skip <out>/fs/, <out>/fs__bad_overlaps/,
+      'no':            skip <out>/fs/, <out>/_DO_NOT_USE_invalid_pes/,
                        <out>/Registry/, <out>/attributes.ini. Output is
                        <out>/rom_meta.json + <out>/Sections/ only.
 
