@@ -237,6 +237,9 @@ def _new_rom_meta():
         # Internal scratch (stripped before emit):
         '_romhdr_va_raw':   0,    # u32 at ECEC+4
         '_romhdr_off':      0,    # u32 at ECEC+8
+        '_module_ranges':   [],   # (dataptr, psize) for every module's o32
+                                  # records; used to compute the
+                                  # Sections/ complement
     }
 
 
@@ -288,14 +291,64 @@ def _write_rom_meta(out_dir, rom_meta):
 
 # ── Sections/ emission ──────────────────────────────────────────────────────
 
+def _rom_va_span(fmt, rom_meta, b000ff_records, nb0_data, nb0_load_offset):
+    """Return (lo, hi) - the kernel-VA range the ROM spans. None if
+    unknown."""
+    hdr = rom_meta.get('romhdr') or {}
+    physfirst = int(hdr.get('physfirst', '0x0'), 16)
+    physlast  = int(hdr.get('physlast',  '0x0'), 16)
+    if physfirst and physlast and physlast > physfirst:
+        return physfirst, physlast
+    if fmt == 'b000ff' and b000ff_records:
+        load_offset = rom_meta.get('_load_offset', 0)
+        flat_base_va = min(r[0] for r in b000ff_records)
+        va_shift = load_offset - flat_base_va
+        lo = min(r[0] for r in b000ff_records) + va_shift
+        hi = max(r[0] + r[1] for r in b000ff_records) + va_shift
+        return lo, hi
+    if fmt == 'nb0' and nb0_data is not None and nb0_load_offset is not None:
+        return nb0_load_offset, nb0_load_offset + len(nb0_data)
+    return None, None
+
+
+def _range_complement(lo, hi, ranges):
+    """Return list of (start, end) covering [lo, hi) minus the union of
+    `ranges`. `ranges` need not be sorted or merged."""
+    if lo >= hi:
+        return []
+    if not ranges:
+        return [(lo, hi)]
+    sorted_ranges = sorted(ranges)
+    merged = [list(sorted_ranges[0])]
+    for s, e in sorted_ranges[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    out = []
+    cur = lo
+    for s, e in merged:
+        if e <= cur:
+            continue
+        if s > cur:
+            out.append((cur, min(s, hi)))
+        cur = max(cur, e)
+        if cur >= hi:
+            break
+    if cur < hi:
+        out.append((cur, hi))
+    return out
+
+
+
 def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
                    b000ff_data=None, b000ff_records=None,
                    nb0_data=None, nb0_load_offset=None):
-    """Write Sections/ files. `sections_mode` is 'full' or 'only-overlapping'.
+    """Write Sections/ files. `sections_mode` is 'full' or 'non-module'.
 
     full: B000FF -> one file per ROM section (preserved native layout);
           NB0   -> one file with the whole flat image.
-    only-overlapping: emit only the byte ranges consumers need without
+    non-module: emit only the byte ranges consumers need without
           fs/ - shared-RVA module sections + the IMGFS region.
     """
     sec_dir = os.path.join(out_dir, "Sections")
@@ -329,50 +382,31 @@ def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
             print(f"  1 section dumped -> {sec_dir}")
         return
 
-    # 'only-overlapping'
-    needed = []
-    for mod in rom_meta.get('modules', []):
-        if not mod.get('shared_rva'):
-            continue
-        for sec in mod.get('sections', []):
-            dataptr = int(sec['dataptr'], 16)
-            psize = int(sec['psize'], 16)
-            if dataptr and psize:
-                needed.append((dataptr, dataptr + psize))
-
-    # IMGFS region (in kernel-VA space)
-    if fmt == 'b000ff':
-        # Find IMGFS by scanning each record's bytes for the UUID, then
-        # include that record + every subsequent record (IMGFS sits at the
-        # tail of B000FF ROMs in practice).
-        imgfs_record_idx = None
-        for i, (sec_base, sec_size, file_off) in enumerate(b000ff_records):
-            sec_bytes = b000ff_data[file_off:file_off + sec_size]
-            if IMGFS_UUID in sec_bytes:
-                imgfs_record_idx = i
-                break
-        if imgfs_record_idx is not None:
-            for sec_base, sec_size, file_off in b000ff_records[imgfs_record_idx:]:
-                kva = sec_base + va_shift
-                needed.append((kva, kva + sec_size))
-    else:  # nb0
-        imgfs_off = find_imgfs_base(nb0_data)
-        if imgfs_off >= 0:
-            imgfs_va = nb0_load_offset + imgfs_off
-            imgfs_end_va = nb0_load_offset + len(nb0_data)
-            needed.append((imgfs_va, imgfs_end_va))
-
-    if not needed:
-        print(f"  Sections/ empty (no shared-RVA modules, no IMGFS)")
+    # 'non-module' = the complement of module dataptr ranges
+    # within the ROM's kernel-VA span. Per-module bytes (every o32_rom
+    # record's psize bytes at dataptr) are now reachable via the PE
+    # container in fs/Windows/<name> and its embedded `.cerom` section -
+    # consumers don't need them in Sections/. What's left in [physfirst,
+    # physlast] is "everything not in a module": bootloaders, ROMHDR /
+    # TOC / FILESentry / COPYentry / ROMPID kernel structures, the
+    # IMGFS region (when present), strings, padding.
+    rom_lo, rom_hi = _rom_va_span(fmt, rom_meta, b000ff_records,
+                                  nb0_data, nb0_load_offset)
+    if rom_lo is None:
+        print(f"  Sections/ empty (no ROM VA span)")
         return
 
-    needed.sort()
-    merged = [list(needed[0])]
-    for s, e in needed[1:]:
-        if s <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
+    module_ranges = sorted(
+        (dp, dp + sz) for dp, sz in rom_meta.get('_module_ranges', [])
+        if sz > 0
+    )
+    needed = _range_complement(rom_lo, rom_hi, module_ranges)
+
+    if not needed:
+        print(f"  Sections/ empty (every byte covered by a module PE)")
+        return
+
+    merged = [list(r) for r in needed]
 
     written = 0
     for s, e in merged:
@@ -408,7 +442,7 @@ def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
 
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def extract_image(bin_path, fs_mode='raw', sections_mode='only-overlapping'):
+def extract_image(bin_path, fs_mode='raw', sections_mode='non-module'):
     """Extract a Windows CE / Windows Mobile ROM image.
 
     fs_mode controls filesystem reconstruction:
@@ -426,7 +460,7 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='only-overlapping'):
                        <out>/rom_meta.json + <out>/Sections/ only.
 
     sections_mode controls the Sections/ folder:
-      'only-overlapping' (default): emit only byte ranges consumers need
+      'non-module' (default): emit only byte ranges consumers need
                                     without fs/ - shared-RVA module
                                     section data + the IMGFS region
                                     (when present).

@@ -306,7 +306,6 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             continue
 
         win_dir = os.path.join(output_dir, "fs", "Windows")
-        bad_dir = os.path.join(output_dir, "_DO_NOT_USE_invalid_pes")
         if not skip_fs:
             os.makedirs(win_dir, exist_ok=True)
 
@@ -328,16 +327,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             else:
                 fname = f"mod_{i}"
 
-            pe_data, has_shared_rva = reconstruct_pe_xip(
+            toc_dict = {
+                'e32_offset':  e32_va,
+                'o32_offset':  o32_va,
+                'name_offset': fname_va,
+                'load_va':     loadoff_va,
+                'file_size':   fsize,
+                'attributes':  attrs,
+                'filetime_lo': ft_lo,
+                'filetime_hi': ft_hi,
+            }
+            pe_data = reconstruct_pe_xip(
                 data, load_offset, e32_va, o32_va,
-                machine, heuristic=is_heuristic)
+                machine, heuristic=is_heuristic, toc_dict=toc_dict)
             if pe_data:
                 if not skip_fs:
-                    if has_shared_rva:
-                        os.makedirs(bad_dir, exist_ok=True)
-                        outpath = os.path.join(bad_dir, safe_filename(fname))
-                    else:
-                        outpath = os.path.join(win_dir, safe_filename(fname))
+                    outpath = os.path.join(win_dir, safe_filename(fname))
                     with open(outpath, 'wb') as f:
                         f.write(pe_data)
                 extracted_mods += 1
@@ -345,52 +350,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
                 if rom_meta is not None:
                     e32_info = parse_e32_header(data, load_offset, e32_va)
-                    objcnt    = e32_info['objcnt'] if e32_info else 0
-                    e32_vbase = e32_info['vbase']  if e32_info else loadoff_va
-                    # Per-module entry. e32_rom fields that the PE
-                    # container already carries (vbase, vsize, entry_rva,
-                    # stack_max, subsystem*, timestamp, imgflags,
-                    # sect14_*, data_dirs) are emitted ONLY for shared_rva
-                    # modules - those PEs are PE-spec invalid and live in
-                    # _DO_NOT_USE_invalid_pes/, so consumers can't trust
-                    # the OptionalHeader. For legit modules the PE in
-                    # fs/Windows is the source; metadata carries only
-                    # what PE can't (TOCentry pointers, dataptr/realaddr
-                    # in sections[], routing flags).
-                    entry = {
-                        'name':            fname,
-                        'load_va':         _hex(loadoff_va),
-                        'file_size':       fsize,
-                        'xip':             e32_vbase != 0xFFFFF000,
-                        'compressed':      bool(attrs & 0x800),
-                        'shared_rva':      has_shared_rva,
-                        'attributes':      _hex(attrs),
-                        'filetime_lo':     _hex(ft_lo),
-                        'filetime_hi':     _hex(ft_hi),
-                        'e32_offset':      _hex(e32_va),
-                        'o32_offset':      _hex(o32_va),
-                        'name_offset':     _hex(fname_va),
-                        'sections':        parse_section_records(
-                                               data, load_offset, o32_va, objcnt),
-                    }
-                    if has_shared_rva and e32_info:
-                        ce_dds = e32_info['ce_dds']
-                        entry.update({
-                            'vbase':           _hex(e32_info['vbase']),
-                            'vsize':           _hex(e32_info['vsize']),
-                            'entry_rva':       _hex(e32_info['entry_rva']),
-                            'stack_max':       _hex(e32_info['stackmax']),
-                            'subsystem':       e32_info['subsystem'],
-                            'subsystem_major': e32_info['sub_maj'],
-                            'subsystem_minor': e32_info['sub_min'],
-                            'timestamp':       _hex(e32_info['timestamp']),
-                            'imgflags':        _hex16(e32_info['imgflags']),
-                            'sect14_rva':      _hex(e32_info['sect14_rva']),
-                            'sect14_size':     _hex(e32_info['sect14_size']),
-                            'data_dirs':       [_hex(v) for pair in ce_dds
-                                                for v in pair],
-                        })
-                    rom_meta['modules'].append(entry)
+                    objcnt = e32_info['objcnt'] if e32_info else 0
+                    secs = parse_section_records(data, load_offset, o32_va, objcnt)
+                    rvas = [int(s['rva'], 16) for s in secs]
+                    has_shared_rva = len(set(rvas)) != len(rvas)
+                    rom_meta['modules'].append({
+                        'name':       fname,
+                        'shared_rva': has_shared_rva,
+                    })
+                    # Internal: track each module's section dataptr/psize
+                    # ranges so the Sections/ emitter can compute the
+                    # complement (bytes not covered by any module's PE).
+                    rom_meta.setdefault('_module_ranges', []).extend(
+                        (int(s['dataptr'], 16), int(s['psize'], 16))
+                        for s in secs
+                        if int(s['psize'], 16) > 0
+                    )
 
         # Extract files
         extracted_files = 0

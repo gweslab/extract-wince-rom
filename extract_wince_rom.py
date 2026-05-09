@@ -13,18 +13,17 @@ Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0
 
 --fs=MODE controls filesystem reconstruction (default: --fs=raw):
 
-  raw        Reconstruct each module as a PE under <out>/fs/Windows/.
-             Bytes verbatim from ROM at original link-time RVAs. Most
-             modules emit strict-conforming PEs. Modules with shared-RVA
-             sections (CE allows two o32 records at the same rva - a
-             writable RAM-mapped section and a read-only ROM-mapped
-             section overlaid at the same link-time slot, never live
-             simultaneously, but PE format requires distinct
-             VirtualAddresses) are routed to <out>/_DO_NOT_USE_invalid_pes/
-             with original RVAs preserved. PE there is technically
-             PE-spec invalid (Windows PE loader rejects); IDA, Ghidra
-             and objdump parse it. Section runtime layout (realaddr)
-             is in rom_meta.json's modules[i].sections[].
+  raw        Each module emits a PE-spec valid PE under
+             <out>/fs/Windows/<name>. Bytes verbatim from ROM at
+             original link-time RVAs. Every PE has an appended
+             `.cerom` section carrying the per-module TOCentry block
+             (e32_offset, o32_offset, name_offset, load_va, file_size,
+             attributes, filetime, e32_vsize). For modules with
+             shared-RVA collisions or split-address sections, .cerom
+             additionally carries the original o32_rom records and
+             shadow bytes for the second record of any shared-RVA
+             pair. IDA / Ghidra / objdump / the Windows PE loader
+             don't know about .cerom and ignore it.
 
   heuristic  raw + synth .reloc + un-rebase DLLs to ImageBase=
              0x10000000 + IAT bound -> unbound. The .reloc synth has
@@ -34,17 +33,18 @@ Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0
              consumers re-relocate. Not recommended for production.
 
   no         Skip filesystem reconstruction. Output is rom_meta.json
-             + Sections/ only - no fs/, no _DO_NOT_USE_invalid_pes/, no
-             Registry/, no attributes.ini.
+             + Sections/ only - no fs/, no Registry/, no
+             attributes.ini.
 
 --sections=MODE controls the Sections/ folder (default:
-                                              --sections=only-overlapping):
+                                              --sections=non-module):
 
-  only-overlapping  Emit only the byte ranges consumers need without
-                    fs/ - shared-RVA module sections + the IMGFS region
-                    (when present). Smallest output. Suitable for
-                    consumers driving runtime synthesis from rom_meta
-                    + Sections/.
+  non-module  Emit kernel-VA byte ranges that aren't covered by
+                    any module's PE - bootloader, ROMHDR / TOC /
+                    FILESentry / COPYentry / ROMPID kernel structures,
+                    the IMGFS region (when present), strings, padding.
+                    Per-module bytes are already in fs/Windows/<name>'s
+                    PE; this folder fills in everything else.
 
   full              B000FF: one file per ROM section (native layout).
                     NB0: one file with the entire flat kernel-VA image.
@@ -56,7 +56,7 @@ Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0
 def main():
     args = sys.argv[1:]
     fs_mode = 'raw'
-    sections_mode = 'only-overlapping'
+    sections_mode = 'non-module'
     filtered = []
     for a in args:
         if a.startswith('--fs='):
@@ -67,8 +67,8 @@ def main():
             fs_mode = v
         elif a.startswith('--sections='):
             v = a.split('=', 1)[1]
-            if v not in ('full', 'only-overlapping'):
-                print(f"ERROR: invalid --sections value: {v!r}. Use full or only-overlapping.")
+            if v not in ('full', 'non-module'):
+                print(f"ERROR: invalid --sections value: {v!r}. Use full or non-module.")
                 return 1
             sections_mode = v
         else:
@@ -94,13 +94,13 @@ def main():
         print("         unbinding produce structural false positives on some")
         print("         binaries. Not recommended for production input.")
 
-    if fs_mode == 'no' and sections_mode == 'only-overlapping':
-        print("WARNING: --fs=no with --sections=only-overlapping skips most of")
-        print("         the filesystem. Sections/ will only carry shared-RVA")
-        print("         module bytes plus the IMGFS region (if present); fs/")
-        print("         is not produced. Most non-kernel modules and files")
-        print("         will be unreadable from this output. Use")
-        print("         --sections=full or --fs=raw if that's not intended.")
+    if fs_mode == 'no' and sections_mode == 'non-module':
+        print("WARNING: --fs=no with --sections=non-module skips most of")
+        print("         the ROM bytes. fs/ is not produced (no per-module PEs)")
+        print("         and Sections/ only carries non-module byte ranges (the")
+        print("         complement of module dataptr ranges). All module bytes")
+        print("         and metadata are missing. Use --sections=full or")
+        print("         --fs=raw if that's not intended.")
 
     for p in paths:
         if not os.path.isfile(p):

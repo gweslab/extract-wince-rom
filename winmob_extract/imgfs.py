@@ -296,7 +296,6 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
             all_entries.append((eo, raw, magic))
 
     win_dir = os.path.join(output_dir, "fs", "Windows")
-    bad_dir = os.path.join(output_dir, "_DO_NOT_USE_invalid_pes")
     if not skip_fs:
         os.makedirs(win_dir, exist_ok=True)
 
@@ -387,18 +386,26 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
             wrote = False
             has_shared_rva = False
             if sec_data and header:
-                pe, has_shared_rva = reconstruct_pe_imgfs(
-                    header, sec_data, heuristic=is_heuristic)
+                attrs = u32(raw, 0x1c)
+                ft = struct.unpack_from('<Q', raw, 0x20)[0]
+                toc_dict = {
+                    'attributes':  attrs,
+                    'filetime_lo': ft & 0xFFFFFFFF,
+                    'filetime_hi': (ft >> 32) & 0xFFFFFFFF,
+                }
+                pe = reconstruct_pe_imgfs(
+                    header, sec_data, heuristic=is_heuristic, toc_dict=toc_dict)
                 if pe:
                     if not skip_fs:
-                        if has_shared_rva:
-                            os.makedirs(bad_dir, exist_ok=True)
-                            path = os.path.join(bad_dir, safe_filename(name))
-                        else:
-                            path = os.path.join(win_dir, safe_filename(name))
+                        path = os.path.join(win_dir, safe_filename(name))
                         with open(path, 'wb') as f:
                             f.write(pe)
                     wrote = True
+                    info = parse_e32_base(header, 0, E32_DD_OFF_WM5)
+                    if info:
+                        rvas = [u32(header, 0x70 + i * 24 + 4)
+                                for i in range(info['objcnt'])]
+                        has_shared_rva = len(set(rvas)) != len(rvas)
                 else:
                     # Save raw sections as fallback under fs/Windows/
                     if not skip_fs:
@@ -428,46 +435,10 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
                     ft = struct.unpack_from('<Q', raw, 0x20)[0]
                     attr_log['\\Windows\\' + name] = (attrs, ft)
                 if rom_meta is not None:
-                    attrs = u32(raw, 0x1c)
-                    ft = struct.unpack_from('<Q', raw, 0x20)[0]
-                    # IMGFS modules: no TOCentry (paged-loaded by the
-                    # IMGFS layer), no load_va. e32 fields come from the
-                    # module header blob (extended layout); xip flag is
-                    # the CE sentinel check (0xFFFFF000 = slot-loaded).
-                    # Same PE-as-unit principle as XIP modules: e32_rom
-                    # fields the PE already carries are emitted only for
-                    # shared_rva modules (their PE is in
-                    # _DO_NOT_USE_invalid_pes/, untrustable). Legit IMGFS
-                    # modules have their PE in fs/Windows; consumer reads
-                    # the OptionalHeader directly.
-                    info = parse_e32_base(header, 0, E32_DD_OFF_WM5) if header else None
-                    e32_vbase = info['vbase'] if info else 0xFFFFF000
-                    entry = {
-                        'name':            name,
-                        'xip':             e32_vbase != 0xFFFFF000,
-                        'shared_rva':      has_shared_rva,
-                        'attributes':      f'0x{attrs:08X}',
-                        'filetime_lo':     f'0x{ft & 0xFFFFFFFF:08X}',
-                        'filetime_hi':     f'0x{(ft >> 32) & 0xFFFFFFFF:08X}',
-                    }
-                    if has_shared_rva and info:
-                        ce_dds = info['ce_dds']
-                        entry.update({
-                            'vbase':           f'0x{info["vbase"]:08X}',
-                            'vsize':           f'0x{info["vsize"]:08X}',
-                            'entry_rva':       f'0x{info["entry_rva"]:08X}',
-                            'stack_max':       f'0x{info["stackmax"]:08X}',
-                            'subsystem':       info['subsystem'],
-                            'subsystem_major': info['sub_maj'],
-                            'subsystem_minor': info['sub_min'],
-                            'timestamp':       f'0x{info["timestamp"]:08X}',
-                            'imgflags':        f'0x{info["imgflags"]:04X}',
-                            'sect14_rva':      f'0x{info["sect14_rva"]:08X}',
-                            'sect14_size':     f'0x{info["sect14_size"]:08X}',
-                            'data_dirs':       [f'0x{v:08X}' for pair in ce_dds
-                                                for v in pair],
-                        })
-                    rom_meta['modules'].append(entry)
+                    rom_meta['modules'].append({
+                        'name':       name,
+                        'shared_rva': has_shared_rva,
+                    })
             else:
                 mods_fail += 1
 
