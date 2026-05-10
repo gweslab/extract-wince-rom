@@ -131,12 +131,11 @@ The reference Python implementation lives in [`winmob_extract/pe/cerom.py`](winm
 ## Usage
 
 ```
-python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0> [...]
+python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [-o PATH] <image.BIN|.nb0>
 ```
 
-Or place `.BIN`/`.nb0` files next to the script and run without arguments.
-
-Output goes to a directory named after the image (e.g. `WM5_PPC_USA/`):
+`-o PATH` / `--output-dir=PATH` overrides the output directory. Default:
+`<dir-of-input>/<basename>/` (e.g. `C:\data\img.bin` → `C:\data\img\`):
 
 ```
 <image-name>/

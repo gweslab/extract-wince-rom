@@ -442,31 +442,34 @@ def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
 
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def extract_image(bin_path, fs_mode='raw', sections_mode='non-module'):
+def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=None):
     """Extract a Windows CE / Windows Mobile ROM image.
 
     fs_mode controls filesystem reconstruction:
-      'raw' (default): per-module PE with bytes verbatim from ROM at
-                       link-time RVAs. Modules with shared-RVA sections
-                       (CE allows two o32 records at the same rva) go
-                       to <out>/_DO_NOT_USE_invalid_pes/ with original RVAs
-                       preserved (PE-spec invalid; IDA/Ghidra parse fine).
-                       Other modules go to <out>/fs/Windows/.
+      'raw' (default): per-module PE under <out>/fs/Windows/, bytes
+                       verbatim from ROM at link-time RVAs. Every PE
+                       carries an appended `.cerom` section with CE-
+                       specific per-module metadata; shared-RVA /
+                       split-address modules also carry their full
+                       o32_rom set + shadow bytes there.
       'heuristic':     same plus synth .reloc / un-rebase / IAT
                        unbinding passes. Synth has known FPs - not for
                        production use.
-      'no':            skip <out>/fs/, <out>/_DO_NOT_USE_invalid_pes/,
-                       <out>/Registry/, <out>/attributes.ini. Output is
+      'no':            skip <out>/fs/, <out>/Registry/, and
+                       <out>/attributes.ini. Output is
                        <out>/rom_meta.json + <out>/Sections/ only.
 
     sections_mode controls the Sections/ folder:
-      'non-module' (default): emit only byte ranges consumers need
-                                    without fs/ - shared-RVA module
-                                    section data + the IMGFS region
-                                    (when present).
+      'non-module' (default): kernel-VA byte ranges not covered by any
+                                    module's PE (bootloader, ROMHDR /
+                                    TOC / FILESentry / COPYentry /
+                                    ROMPID kernel structures, IMGFS
+                                    region, padding).
       'full':                       B000FF: one file per ROM section
                                     (native layout). NB0: one file with
                                     the entire flat image.
+
+    out_dir defaults to <dir-of-bin>/<basename-without-extension>/.
     """
     skip_fs = (fs_mode == 'no')
     print(f"Reading {bin_path}...")
@@ -474,8 +477,11 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='non-module'):
         data = f.read()
     print(f"  {len(data)} bytes ({len(data) / 1024 / 1024:.1f} MB)")
 
-    base_name = os.path.splitext(os.path.basename(bin_path))[0]
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(bin_path)), base_name)
+    if out_dir is None:
+        base_name = os.path.splitext(os.path.basename(bin_path))[0]
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(bin_path)), base_name)
+    else:
+        out_dir = os.path.abspath(out_dir)
 
     if os.path.exists(out_dir):
         print(f"Cleaning {out_dir}")

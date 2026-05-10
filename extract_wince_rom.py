@@ -8,8 +8,14 @@ from winmob_extract import extract_image
 
 
 HELP = """\
-Usage: python extract_wince_rom.py [--fs=MODE] [--sections=MODE] <image.BIN|.nb0> [...]
-   or: place .BIN/.nb0 files next to this script
+Usage: python extract_wince_rom.py [OPTIONS] <image.BIN|.nb0>
+
+Exactly one input file (relative or absolute path).
+
+-o PATH
+--output-dir=PATH
+            Output directory. Default: <dir-of-input>/<basename>/
+            e.g. C:\\data\\img.bin -> C:\\data\\img\\
 
 --fs=MODE controls filesystem reconstruction (default: --fs=raw):
 
@@ -57,9 +63,14 @@ def main():
     args = sys.argv[1:]
     fs_mode = 'raw'
     sections_mode = 'non-module'
-    filtered = []
-    for a in args:
-        if a.startswith('--fs='):
+    out_dir = None
+    positional = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ('-h', '--help'):
+            print(HELP); return 0
+        elif a.startswith('--fs='):
             v = a.split('=', 1)[1]
             if v not in ('no', 'raw', 'heuristic'):
                 print(f"ERROR: invalid --fs value: {v!r}. Use no, raw, or heuristic.")
@@ -71,23 +82,28 @@ def main():
                 print(f"ERROR: invalid --sections value: {v!r}. Use full or non-module.")
                 return 1
             sections_mode = v
+        elif a.startswith('--output-dir='):
+            out_dir = a.split('=', 1)[1]
+        elif a in ('-o', '--output-dir'):
+            i += 1
+            if i >= len(args):
+                print(f"ERROR: {a} requires a path argument")
+                return 1
+            out_dir = args[i]
         else:
-            filtered.append(a)
-    args = filtered
-    if any(a in args for a in ('-h', '--help')):
-        print(HELP); return 0
+            positional.append(a)
+        i += 1
 
-    if args:
-        paths = args
-    else:
-        here = os.path.dirname(os.path.abspath(__file__))
-        paths = sorted(
-            os.path.join(here, f)
-            for f in os.listdir(here)
-            if f.upper().endswith(('.BIN', '.NB0')) and os.path.isfile(os.path.join(here, f))
-        )
-        if not paths:
-            print(HELP); sys.exit(1)
+    if len(positional) != 1:
+        print(HELP)
+        if len(positional) > 1:
+            print(f"\nERROR: expected exactly one input file, got {len(positional)}")
+        return 1
+
+    bin_path = positional[0]
+    if not os.path.isfile(bin_path):
+        print(f"ERROR: Not found: {bin_path}")
+        return 1
 
     if fs_mode == 'heuristic':
         print("WARNING: --fs=heuristic enabled. Synth .reloc + un-rebase + IAT")
@@ -102,13 +118,8 @@ def main():
         print("         and metadata are missing. Use --sections=full or")
         print("         --fs=raw if that's not intended.")
 
-    for p in paths:
-        if not os.path.isfile(p):
-            print(f"ERROR: Not found: {p}")
-            continue
-        print("=" * 60)
-        extract_image(p, fs_mode=fs_mode, sections_mode=sections_mode)
-        print()
+    extract_image(bin_path, fs_mode=fs_mode, sections_mode=sections_mode,
+                  out_dir=out_dir)
 
 
 if __name__ == '__main__':
