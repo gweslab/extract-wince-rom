@@ -53,10 +53,14 @@ struct cerom_hdr {              // 0x18 bytes
 struct cerom_obj {              // 0x24 bytes per o32_rom record
     uint32 vsize;               // o32_vsize
     uint32 rva;                 // o32_rva (link-time RVA)
-    uint32 psize;               // o32_psize
+    uint32 psize;               // size of shipped bytes (== vsize when the
+                                //   section was decompressed during extraction,
+                                //   original o32_psize otherwise)
     uint32 dataptr;             // o32_dataptr (kernel-VA in the original ROM)
     uint32 realaddr;            // o32_realaddr (runtime VA after MMU map)
-    uint32 flags;               // o32_flags
+    uint32 flags;               // o32_flags with IMAGE_SCN_COMPRESSED (0x2000)
+                                //   cleared if the section was decompressed
+                                //   during extraction
     uint32 is_shadow;           // 0 = primary (PE section header at `rva`
                                 //   has these bytes)
                                 // 1 = shadow (different o32 owns the PE

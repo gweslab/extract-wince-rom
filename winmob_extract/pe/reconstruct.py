@@ -116,6 +116,18 @@ def _patch_realaddr_refs(sections, realaddr_map, vbase):
         sec['raw_size'] = len(sec['data'])
 
 
+def _decompressed_aware_records(o32_records):
+    """For sections decompressed during extraction, clear IMAGE_SCN_COMPRESSED
+    and set psize = vsize so cerom_obj describes the bytes shipped."""
+    out = []
+    for sv, sr, sp, sd, sa, sf in o32_records:
+        if (sf & 0x2000) and sp < sv:
+            out.append((sv, sr, sv, sd, sa, sf & ~0x2000))
+        else:
+            out.append((sv, sr, sp, sd, sa, sf))
+    return out
+
+
 def _append_cerom_section(sections, cerom_blob):
     """Append a `.cerom` section past the highest existing section.
 
@@ -255,8 +267,8 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
                     data = dec
             return data
 
-        cerom_blob = build_cerom_blob(o32_records, primary_indices, toc,
-                                      get_shadow_bytes)
+        cerom_blob = build_cerom_blob(_decompressed_aware_records(o32_records),
+                                      primary_indices, toc, get_shadow_bytes)
     else:
         cerom_blob = build_cerom_blob([], set(), toc, lambda i: b'')
     _append_cerom_section(sections, cerom_blob)
@@ -345,7 +357,8 @@ def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False,
     toc = dict(toc_dict or {})
     toc.setdefault('e32_vsize', info['vsize'])
     if needs_cerom:
-        cerom_blob = build_cerom_blob(o32_records, primary_indices, toc,
+        cerom_blob = build_cerom_blob(_decompressed_aware_records(o32_records),
+                                      primary_indices, toc,
                                       lambda i: section_bytes_map.get(i, b''))
     else:
         cerom_blob = build_cerom_blob([], set(), toc, lambda i: b'')
