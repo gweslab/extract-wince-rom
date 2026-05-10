@@ -129,8 +129,9 @@ The reference Python implementation lives in [`winmob_extract/pe/cerom.py`](winm
 
 `--sections=MODE` controls the `Sections/` folder:
 
-- **`non-module`** (default). Emit only what's *not* in any module's PE — bootloaders, ROMHDR / TOC / FILESentry / COPYentry / ROMPID kernel structures, the IMGFS region (when present), strings, padding. Each per-module byte range is already reachable through that module's PE in `fs/Windows/`, so this folder excludes them. Smallest output.
+- **`non-module`** (default). Emit only what's *not* in any module's PE — bootloaders, ROMHDR / TOC / FILESentry / COPYentry / ROMPID kernel structures, the IMGFS region (when present), strings, padding. Each per-module byte range is already reachable through that module's PE in `fs/Windows/`, so this folder excludes them.
 - **`full`**. B000FF: one file per ROM section (native layout). NB0: one file with the entire flat kernel-VA image. Suitable for full reverse engineering or recovering bootloaders / boot images that have no ECEC marker.
+- **`no`**. Skip the `Sections/` folder entirely.
 
 ## Usage
 

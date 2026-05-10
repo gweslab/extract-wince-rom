@@ -56,6 +56,9 @@ Exactly one input file (relative or absolute path).
                     NB0: one file with the entire flat kernel-VA image.
                     Suitable for full reverse engineering or recovering
                     bootloaders / boot images that have no ECEC marker.
+
+  no                Skip Sections/ entirely. No <out>/Sections/
+                    folder is produced.
 """
 
 
@@ -78,8 +81,8 @@ def main():
             fs_mode = v
         elif a.startswith('--sections='):
             v = a.split('=', 1)[1]
-            if v not in ('full', 'non-module'):
-                print(f"ERROR: invalid --sections value: {v!r}. Use full or non-module.")
+            if v not in ('full', 'non-module', 'no'):
+                print(f"ERROR: invalid --sections value: {v!r}. Use full, non-module, or no.")
                 return 1
             sections_mode = v
         elif a.startswith('--output-dir='):

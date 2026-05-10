@@ -344,13 +344,16 @@ def _range_complement(lo, hi, ranges):
 def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
                    b000ff_data=None, b000ff_records=None,
                    nb0_data=None, nb0_load_offset=None):
-    """Write Sections/ files. `sections_mode` is 'full' or 'non-module'.
+    """Write Sections/ files. `sections_mode` is 'full', 'non-module', or 'no'.
 
     full: B000FF -> one file per ROM section (preserved native layout);
           NB0   -> one file with the whole flat image.
     non-module: emit only the byte ranges consumers need without
           fs/ - shared-RVA module sections + the IMGFS region.
+    no: skip the Sections/ folder entirely.
     """
+    if sections_mode == 'no':
+        return
     sec_dir = os.path.join(out_dir, "Sections")
     os.makedirs(sec_dir, exist_ok=True)
 
@@ -468,6 +471,7 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=N
       'full':                       B000FF: one file per ROM section
                                     (native layout). NB0: one file with
                                     the entire flat image.
+      'no':                         skip the Sections/ folder entirely.
 
     out_dir defaults to <dir-of-bin>/<basename-without-extension>/.
     """
