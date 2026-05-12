@@ -398,15 +398,16 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                     attr_log['\\Windows\\' + fname] = (attrs, (ft_hi << 32) | ft_lo)
                 if rom_meta is not None:
                     rom_meta['files'].append({
-                        'name':            fname,
-                        'load_va':         _hex(loadoff),
-                        'real_size':       real_size,
-                        'compressed_size': comp_size,
-                        'compressed':      comp_size != real_size,
-                        'attributes':      _hex(attrs),
-                        'filetime_lo':     _hex(ft_lo),
-                        'filetime_hi':     _hex(ft_hi),
-                        'name_offset':     _hex(fname_va),
+                        'name':                       fname,
+                        'load_va':                    _hex(loadoff),
+                        'real_size':                  real_size,
+                        'compressed_size':            comp_size,
+                        'compressed':                 comp_size != real_size,
+                        'compressed_after_extraction': len(raw) != real_size,
+                        'attributes':                 _hex(attrs),
+                        'filetime_lo':                _hex(ft_lo),
+                        'filetime_hi':                _hex(ft_hi),
+                        'name_offset':                _hex(fname_va),
                     })
 
         total_mods += extracted_mods

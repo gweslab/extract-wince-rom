@@ -46,30 +46,33 @@ struct cerom_hdr {              // 0x18 bytes
     uint32 version;             // 1
     uint32 hdr_size;            // 0x18
     uint32 n_objects;           // 0 for pure modules, else e32.objcnt
-    uint32 obj_size;            // 0x24
+    uint32 obj_size;            // 0x2C
     uint32 toc_off;             // offset of cerom_toc within the blob
 };
 
-struct cerom_obj {              // 0x24 bytes per o32_rom record
-    uint32 vsize;               // o32_vsize
-    uint32 rva;                 // o32_rva (link-time RVA)
-    uint32 psize;               // size of shipped bytes (== vsize when the
-                                //   section was decompressed during extraction,
-                                //   original o32_psize otherwise)
-    uint32 dataptr;             // o32_dataptr (kernel-VA in the original ROM)
-    uint32 realaddr;            // o32_realaddr (runtime VA after MMU map)
-    uint32 flags;               // o32_flags with IMAGE_SCN_COMPRESSED (0x2000)
-                                //   cleared if the section was decompressed
-                                //   during extraction
-    uint32 is_shadow;           // 0 = primary (PE section header at `rva`
-                                //   has these bytes)
-                                // 1 = shadow (different o32 owns the PE
-                                //   section at `rva`; this one's bytes -
-                                //   if any - are at shadow_off below)
-    uint32 shadow_off;          // offset within .cerom of shadow bytes,
-                                //   or 0 (primary, or BSS-only shadow
-                                //   with psize == 0)
-    uint32 shadow_size;         // psize when bytes are embedded, 0 otherwise
+struct cerom_obj {                  // 0x2C bytes per o32_rom record
+    // original ROM values (verbatim from BIN, never overwritten)
+    uint32 vsize;                   // o32_vsize
+    uint32 rva;                     // o32_rva (link-time RVA)
+    uint32 psize;                   // o32_psize
+    uint32 dataptr;                 // o32_dataptr (kernel-VA in original ROM)
+    uint32 realaddr;                // o32_realaddr (runtime VA after MMU map)
+    uint32 flags;                   // o32_flags
+
+    // bundle layout descriptors
+    uint32 is_shadow;               // 0 = primary (PE section header at `rva`
+                                    //   has these bytes), 1 = shadow
+    uint32 shadow_off;              // offset within .cerom of shadow bytes,
+                                    //   0 when no bytes are embedded
+    uint32 shadow_size;             // size of shadow bytes, 0 otherwise
+
+    // post-extraction state (describes the bytes shipped in the bundle)
+    uint32 flags_after_extraction;  // flags matching the bytes on disk;
+                                    //   IMAGE_SCN_COMPRESSED (0x2000) cleared
+                                    //   if the extractor decompressed the section
+    uint32 psize_after_extraction;  // size of the bytes on disk:
+                                    //   == vsize when decompressed,
+                                    //   == psize otherwise
 };
 
 struct cerom_toc {              // 0x24 bytes
@@ -94,7 +97,7 @@ struct cerom_toc {              // 0x24 bytes
 | Module shape                      | `.cerom` content                       | Size            |
 |-----------------------------------|----------------------------------------|-----------------|
 | Pure (no shared-RVA, no split)    | header + TOC                           | `0x3C` bytes    |
-| Shared-RVA or split-address       | header + TOC + `cerom_obj[]`           | `0x3C + n×0x24` |
+| Shared-RVA or split-address       | header + TOC + `cerom_obj[]`           | `0x3C + n×0x2C` |
 | Shared-RVA with shadow bytes      | + concatenated shadow blobs            | + Σ shadow_size |
 
 ### Consuming it
