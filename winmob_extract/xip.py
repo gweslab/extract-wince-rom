@@ -33,8 +33,16 @@ def find_all_ecec(data, limit=None):
         if idx + 12 <= len(data):
             ptoc_va = u32(data, idx + 4)
             romhdr_off = u32(data, idx + 8)
+            # ECEC+8 (ROM_TOC_OFFSET_OFFSET) is a CE5+ convenience. Pre-CE5
+            # ROMs (CE3 / HPC2000 / WM2003) leave it unused - commonly
+            # 0xFFFFFFFF from erased flash. Treat any out-of-range value as
+            # absent (0) rather than disqualifying the ECEC: detection keys on
+            # ptoc_va, and the extractor derives the load base from it when
+            # romhdr_off is 0 (see the candidate list in extract_xip_regions).
+            if not (0 <= romhdr_off < 0x10000000):
+                romhdr_off = 0
             # VA should be in CE kernel range
-            if 0x80000000 <= ptoc_va < 0xC0000000 and romhdr_off < 0x10000000:
+            if 0x80000000 <= ptoc_va < 0xC0000000:
                 results.append((idx, ptoc_va, romhdr_off))
         pos = idx + 4
     return results

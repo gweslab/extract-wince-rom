@@ -174,6 +174,7 @@ python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [-o PATH] <image.BIN|.
 
 | Image(s) | OS | Arch | Device | Format |
 |----------|----|------|--------|--------|
+| `jornada720.bin` | Handheld PC 2000 (CE 3.0) | ARM | HP Jornada 720 (StrongARM SA-1110) | NB0 (flat XIP) |
 | `IPAQROM177.nb0` | Pocket PC 2000 | ARM | Compaq iPAQ 3600/3650 | NB0 |
 | `ASUS_A6X6_WM61.nb0` | Windows Mobile 6.1 | ARM | Asus Mypal A6x6 | NB0 |
 | `WM2003SE.bin` | Windows Mobile 2003 SE | ARM | Device Emulator | B000FF |
