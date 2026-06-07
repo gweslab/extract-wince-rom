@@ -16,6 +16,8 @@ from ..util import u16, u32
 
 E32_DD_OFF_LEGACY = 0x20
 E32_DD_OFF_WM5    = 0x24  # name kept for back-compat; actual layout = "extended"
+E32_DD_OFF_CE2    = 0x1C  # CE 2.x: e32_subsys (u32) at 0x18, DD array at 0x1C,
+                          # no e32_sect14 field (added in CE3).
 O32_SIZE = 24             # sizeof(o32_rom)
 
 
@@ -31,22 +33,29 @@ def parse_e32_base(data, off, dd_offset):
     sub_min   = u16(data, off + 0x0E)
     stackmax  = u32(data, off + 0x10)
     vsize     = u32(data, off + 0x14)
-    # The extended layout has a 4-byte field at +0x20 the legacy layout
-    # lacks (legacy puts DD[0] there instead). Semantics unverified;
-    # preserved verbatim into the output COFF TimeDateStamp.
-    ts = u32(data, off + 0x20) if dd_offset == E32_DD_OFF_WM5 else 0
+
+    if dd_offset == E32_DD_OFF_CE2:
+        # CE 2.x: e32_subsys sits at 0x18 (before the DD array), the DD
+        # array at 0x1C, and there is no e32_sect14 field or timestamp.
+        subsys = u16(data, off + 0x18)
+        sect14_rva = 0
+        sect14_size = 0
+        ts = 0
+    else:
+        # The extended layout has a 4-byte field at +0x20 the legacy layout
+        # lacks (legacy puts DD[0] there instead). Semantics unverified;
+        # preserved verbatim into the output COFF TimeDateStamp.
+        ts = u32(data, off + 0x20) if dd_offset == E32_DD_OFF_WM5 else 0
+        # e32_subsys is at offset dd_offset+72 (after the 9 data dirs).
+        subsys_off = dd_offset + 72
+        subsys = u16(data, off + subsys_off) if off + subsys_off + 2 <= len(data) else 9
+        sect14_rva = u32(data, off + 0x18)
+        sect14_size = u32(data, off + 0x1C)
 
     ce_dds = []
     for i in range(9):
         d = off + dd_offset + i * 8
         ce_dds.append((u32(data, d), u32(data, d + 4)))
-
-    # e32_subsys is at offset 0x6C (after 9 data dirs ending at dd_offset + 72)
-    subsys_off = dd_offset + 72
-    subsys = u16(data, off + subsys_off) if off + subsys_off + 2 <= len(data) else 9
-
-    sect14_rva = u32(data, off + 0x18)
-    sect14_size = u32(data, off + 0x1C)
 
     return dict(objcnt=objcnt, imgflags=imgflags, entry_rva=entry_rva,
                 vbase=vbase, sub_maj=sub_maj, sub_min=sub_min,
@@ -109,6 +118,9 @@ def parse_e32_auto(data, off):
     info_leg = parse_e32_base(data, off, E32_DD_OFF_LEGACY)
     if _layout_valid(info_leg):
         candidates.append((_layout_score(info_leg), info_leg, E32_DD_OFF_LEGACY))
+    info_ce2 = parse_e32_base(data, off, E32_DD_OFF_CE2)
+    if _layout_valid(info_ce2):
+        candidates.append((_layout_score(info_ce2), info_ce2, E32_DD_OFF_CE2))
     if not candidates:
         return None, None
     # Highest score wins; on tie, WM5 wins (newer layout, listed first).

@@ -166,7 +166,11 @@ def _ce3_bin_decompress_block(src, dst_max):
                 for k in range(length):
                     if di >= dst_max:
                         break
-                    out[di] = out[src_pos + k]
+                    p = src_pos + k
+                    # A match near a short final block can reference past the
+                    # block's output bound; treat out-of-range as zero rather
+                    # than indexing off the end.
+                    out[di] = out[p] if 0 <= p < dst_max else 0
                     di += 1
     return bytes(out[:di])
 

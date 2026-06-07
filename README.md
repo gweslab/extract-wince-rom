@@ -2,7 +2,7 @@
 
 Decomposes Windows CE ROM images (.BIN, .nb0) into smallest chunks: PE executables, media, registry, directory structure, and a `rom_meta.json` describing the ROMHDR / TOC / FILES / ROMPID metadata.
 
-Targets Microsoft Device Emulator images and OEM dumps from Pocket PC 2000 through Windows Phone 7, including Zune OS (CE 5.0 / CE 6.0) firmware.
+Targets Microsoft Device Emulator images and OEM dumps from Windows CE 2.11 (Handheld PC Professional) through Windows Phone 7, including Zune OS (CE 5.0 / CE 6.0) firmware.
 
 > [!WARNING]
 > **`.reloc` synthesis is inherently approximate** and is **off by default**. It runs only under `--fs=heuristic`. The ROM builder strips the original base-relocation directory, so there is no ground truth — synth entries are reconstructed by scanning section bytes for 4-byte values that fall within the module's image range. ARM instruction encodings, resource sentinels, and coincidental in-range values all collide with real pointers; expect false positives that corrupt embedded constants when consumers re-relocate the PE. Default (`--fs=raw`) skips synth entirely and sets `IMAGE_FILE_RELOCS_STRIPPED` so loaders fail loud rather than apply a faulty table.
@@ -12,7 +12,8 @@ Targets Microsoft Device Emulator images and OEM dumps from Pocket PC 2000 throu
 ## Features
 
 - **B000FF** (sectioned container) and **NB0** (flat binary) ROM formats
-- **XIP modules** with LZX (CE 4+) and CE3 BIN (Pocket PC 2000) decompression, and PE32 reconstruction from `e32_rom`/`o32_rom` headers
+- **XIP modules** with LZX (CE 4+) and CE3 BIN (CE 2.x / Pocket PC 2000) decompression, and PE32 reconstruction from `e32_rom`/`o32_rom` headers
+- **CE 2.x ROMs** (Handheld PC Professional, CE 2.11) — these predate the `ECEC` ROM signature (added in CE3), so the ROMHDR is located by a structural scan validated against the module TOC (`nk.exe` present). Their `e32_rom` also differs: `e32_subsys` sits at offset `0x18` with the data-directory array at `0x1C` and no `e32_sect14` field, where CE3+ moved the subsystem field after the directories and added `sect14`. Both layouts are detected automatically.
 - **IMGFS filesystem** extraction with Flash Translation Layer page mapping and XPRESS decompression
 - **Every module emits a PE-spec valid container with an appended `.cerom` section** carrying the per-module CE metadata PE format can't natively encode. See [The `.cerom` section](#the-cerom-section) for the format spec.
 - **Relocation fixup** for XIP PEs (heuristic mode only): patches split-address references (`o32_realaddr`) and synthesizes `.reloc` sections by scanning for absolute references
@@ -174,6 +175,7 @@ python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [-o PATH] <image.BIN|.
 
 | Image(s) | OS | Arch | Device | Format |
 |----------|----|------|--------|--------|
+| `jornada820.bin` | Handheld PC Professional (CE 2.11) | ARM | HP Jornada 820 (StrongARM SA-1100) | NB0 (flat XIP, no `ECEC`) |
 | `jornada720.bin` | Handheld PC 2000 (CE 3.0) | ARM | HP Jornada 720 (StrongARM SA-1110) | NB0 (flat XIP) |
 | `IPAQROM177.nb0` | Pocket PC 2000 | ARM | Compaq iPAQ 3600/3650 | NB0 |
 | `ASUS_A6X6_WM61.nb0` | Windows Mobile 6.1 | ARM | Asus Mypal A6x6 | NB0 |

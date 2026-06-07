@@ -48,6 +48,55 @@ def find_all_ecec(data, limit=None):
     return results
 
 
+def find_romhdr_structural(data):
+    """Locate the ROMHDR when there is no ECEC marker (CE 2.x ROMs — the
+    ECEC signature slot was added in CE3 romldr.h). Slide a validating
+    window and confirm the TOC resolves printable module names including
+    nk.exe, matching CERF rom_image_parse.cpp ResolveRomhdrStructural.
+
+    Returns (romhdr_off, load_offset, ptoc_va) or None. load_offset is the
+    XIP base such that file_offset == VA - load_offset; for a carved XIP
+    region that is physfirst.
+    """
+    n = len(data)
+    for off in range(0, n - ROMHDR_SIZE, 4):
+        # Cheap prefilter: physfirst is a CE kernel VA and physlast a
+        # sane distance above it. Rejects almost every offset before the
+        # full parse.
+        physfirst = u32(data, off + 8)
+        if physfirst < 0x80000000:
+            continue
+        physlast = u32(data, off + 12)
+        if not (physfirst < physlast <= physfirst + 0x10000000):
+            continue
+        hdr = parse_romhdr(data, off)
+        if hdr is None or not (1 <= hdr['nummods'] <= 4096):
+            continue
+        load_offset = hdr['physfirst']
+        toc_start = off + ROMHDR_SIZE
+        names_ok = True
+        have_nk = False
+        for i in range(min(hdr['nummods'], 32)):
+            e = toc_start + i * TOCENTRY_SIZE
+            if e + TOCENTRY_SIZE > n:
+                names_ok = False
+                break
+            fname_off = u32(data, e + 0x10) - load_offset
+            if not (0 <= fname_off < n - 1):
+                names_ok = False
+                break
+            name = read_ascii(data, fname_off)
+            if not name or any(c < 0x20 or c > 0x7E for c in name.encode('latin1', 'replace')):
+                names_ok = False
+                break
+            if name.lower() == 'nk.exe':
+                have_nk = True
+        if names_ok and have_nk:
+            ptoc_va = (load_offset + off) & 0xFFFFFFFF
+            return off, load_offset, ptoc_va
+    return None
+
+
 def parse_romhdr(data, off):
     """Parse ROMHDR at the given offset. Returns dict or None."""
     if off < 0 or off + ROMHDR_SIZE > len(data):
@@ -235,8 +284,19 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
     ececs = find_all_ecec(data, limit=ecec_limit)
 
     if not ececs:
-        print(f"{label}  No ECEC signatures found")
-        return
+        # CE 2.x ROMs carry no ECEC marker. Recover the ROMHDR by
+        # structural scan, then synthesize the (ecec_off, ptoc_va,
+        # romhdr_off_field) triple the loop below consumes: ecec_off=0x40
+        # makes xip_base=0 so romhdr_off_field == romhdr_off, and
+        # ptoc_va == load_offset+romhdr_off makes load_offset resolve back
+        # to physfirst.
+        structural = find_romhdr_structural(data)
+        if structural is None:
+            print(f"{label}  No ECEC signatures found")
+            return
+        romhdr_off, _load_offset, ptoc_va = structural
+        print(f"{label}  No ECEC marker — structural ROMHDR @ 0x{romhdr_off:X} (CE 2.x)")
+        ececs = [(0x40, ptoc_va, romhdr_off)]
 
     total_mods = 0
     total_files = 0
