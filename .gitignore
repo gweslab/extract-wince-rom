@@ -9,3 +9,4 @@
 !winmob_extract/*.py
 !winmob_extract/pe
 !winmob_extract/pe/*.py
+__py__cache__
