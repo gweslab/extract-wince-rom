@@ -7,15 +7,16 @@ ROM_TOC_OFFSET_OFFSET (+0x48). Pre-CE5 ROMs only define the signature
 slot; +4/+8 may be unused or used as an undocumented convenience.
 """
 
-import base64
 import os
 import struct
 
-from .util import (u32, u16, read_ascii, safe_filename,
+from .util import (u32, read_ascii, safe_filename,
                    ROMHDR_SIZE, TOCENTRY_SIZE, FILEENTRY_SIZE)
 from .compress import ce_rom_decompress
 from .pe import reconstruct_pe_xip
-from .pe.e32 import parse_e32_auto
+from .rom_structs import (_hex, _hex16, parse_rompid_chain,
+                          parse_e32_header, parse_section_records,
+                          parse_copy_table)
 
 
 def find_all_ecec(data, limit=None):
@@ -126,136 +127,61 @@ def parse_romhdr(data, off):
     return hdr
 
 
-def parse_rompid_chain(data, load_offset, head_va):
-    """Walk a ROMPID extension linked list starting at head_va. Returns a
-    list of dicts ready for rom_meta.json's `rompid` field. Empty list when
-    head_va is 0 or the chain doesn't parse.
+def _derive_base_from_ptoc(data, ptoc_va):
+    """Derive (romhdr_off, load_offset) for a region whose load base is not
+    supplied externally (an NB0 region image run from RAM: the file is the
+    region itself, with no container header to carry the base).
 
-    Layout assumed (per CE conventions): each ROMPID node has
-        type        : DWORD
-        pNextExt    : DWORD (VA of next, 0 = end)
-        pdata       : DWORD (VA of data blob)
-        length      : DWORD (data length)
-        pszName     : DWORD (VA of ASCII name string)
-    Total 20 bytes. Inline-name layouts (no pszName VA) are not handled
-    here; the chain bails on the first node that produces inconsistent
-    values rather than emit garbage.
+    The ROMHDR sits at VA ptoc_va, so its file offset is ptoc_va - physfirst.
+    physfirst is unknown, but the ROMHDR carries its own physfirst field
+    (ROMHDR+8), which closes the loop: the real ROMHDR is the offset `off`
+    where physfirst(off) + off == ptoc_va. That fixpoint is the exact
+    self-consistency test. Returns (off, physfirst) or None.
+    A cheap u32 prefilter rejects almost every offset before the full parse.
     """
-    chain = []
-    seen = set()
-    node_va = head_va
-    while node_va and node_va not in seen and len(chain) < 64:
-        seen.add(node_va)
-        node_off = node_va - load_offset
-        if not (0 <= node_off and node_off + 20 <= len(data)):
-            break
-        type_, next_va, pdata_va, length, name_va = \
-            struct.unpack_from('<5I', data, node_off)
-        # Sanity gate: length should be reasonable
-        if length > 0x10000000:
-            break
-        # Treat all-zero / placeholder nodes as "no extension". Real
-        # ROMPID entries have at least a type or a name pointer or a
-        # non-zero data length.
-        if type_ == 0 and length == 0 and name_va == 0 and pdata_va == 0:
-            break
-        # Decode name if pointer is plausible
-        name = ''
-        if 0 < name_va:
-            name_off = name_va - load_offset
-            if 0 <= name_off < len(data) - 1:
-                name = read_ascii(data, name_off)
-        # Decode data blob if pointer is plausible
-        data_b64 = ''
-        if length and 0 < pdata_va:
-            pdata_off = pdata_va - load_offset
-            if 0 <= pdata_off and pdata_off + length <= len(data):
-                data_b64 = base64.b64encode(
-                    data[pdata_off:pdata_off + length]).decode('ascii')
-        chain.append({
-            'name': name,
-            'type': type_,
-            'data_b64': data_b64,
-            'length': length,
-        })
-        node_va = next_va
-    return chain
+    n = len(data)
+    for off in range(0, n - ROMHDR_SIZE, 4):
+        if (u32(data, off + 8) + off) & 0xFFFFFFFF != ptoc_va:
+            continue
+        hdr = parse_romhdr(data, off)
+        if hdr is not None and 1 <= hdr['nummods'] <= 4096:
+            return off, hdr['physfirst']
+    return None
 
 
-def parse_e32_header(data, load_offset, e32_va):
-    """Read e32_rom fields needed for rom_meta module entries: image size,
-    entry RVA, image base, subsystem, subsystem version, timestamp, image
-    flags, object count. Tries the extended layout first (4-byte timestamp
-    field at +0x20 + DD array at +0x24) and falls back to legacy (DD array
-    at +0x20, no timestamp field) when extended fails validity checks.
-    Returns dict or None if the e32 header isn't readable.
-    """
-    info, _ = parse_e32_auto(data, e32_va - load_offset)
-    return info
+def _region_candidates(base_offset, ecec_off, ptoc_va, romhdr_off_field):
+    """Build the (romhdr_off, load_offset) candidate list for one ECEC using
+    the externally-supplied base. (Self-consistent derivation is a separate
+    fallback - see _derive_base_from_ptoc.)"""
+    if romhdr_off_field:
+        # ECEC+8 holds the ROMHDR offset from physfirst.
+        xip_base = max(ecec_off - 0x40, 0)
+        romhdr_off = xip_base + romhdr_off_field
+        return [(romhdr_off, ptoc_va - romhdr_off)]
+    # ECEC+8 zero: try the explicit base_offset, the kernel-VA mirror (some
+    # B000FF images carry physical addresses in the section table while ECEC
+    # still carries the virtual VA), and high-bit masks of the value at ECEC+4.
+    candidates = [(ptoc_va - base_offset, base_offset)]
+    mirror = base_offset | 0x80000000
+    if mirror != base_offset:
+        candidates.append((ptoc_va - mirror, mirror))
+    for mask in (0xFF000000, 0xF0000000):
+        cand_load = ptoc_va & mask
+        cand_off = ptoc_va - cand_load
+        if (cand_off, cand_load) not in candidates:
+            candidates.append((cand_off, cand_load))
+    return candidates
 
 
-def parse_section_records(data, load_offset, o32_va, objcnt):
-    """Read `objcnt` o32_rom records (24 bytes each) starting at VA `o32_va`.
-
-    Each record exposes {vsize, rva, psize, dataptr, realaddr, flags}. CE
-    splits between `rva` (link-time RVA) and `realaddr` (runtime VA the
-    kernel maps the section to via MMU): they differ for sections that
-    live in ROM but are mapped to RAM at runtime, and for sections whose
-    runtime address differs from `vbase + rva`. PE reconstruction
-    flattens both into the on-disk PE, so the original split is only
-    recoverable from these records.
-    """
-    if not o32_va or not objcnt or objcnt > 64:
-        return []
-    base_off = o32_va - load_offset
-    if base_off < 0 or base_off + objcnt * 24 > len(data):
-        return []
-    out = []
-    for s in range(objcnt):
-        sv, sr, sp, sd, sa, sf = struct.unpack_from('<6I', data, base_off + s * 24)
-        out.append({
-            'vsize':    _hex(sv),
-            'rva':      _hex(sr),
-            'psize':    _hex(sp),
-            'dataptr':  _hex(sd),
-            'realaddr': _hex(sa),
-            'flags':    _hex(sf),
-        })
-    return out
-
-
-def parse_copy_table(data, load_offset, copy_va, n_entries):
-    """Parse the ROMHDR copy table at `copy_va` (n_entries x 16 bytes).
-
-    Each COPYentry is { ulSource, ulDest, ulCopyLen, ulDestLen }: copy
-    `ulCopyLen` bytes src->dst, then zero-fill the remaining
-    `ulDestLen - ulCopyLen` bytes at dst+ulCopyLen. The kernel runs this
-    pass early in startup (CE5+ sub_80095584) to materialise .data/.bss
-    in RAM before any /GS-protected code runs.
-    """
-    if not copy_va or not n_entries or n_entries > 4096:
-        return []
-    base_off = copy_va - load_offset
-    if base_off < 0 or base_off + n_entries * 16 > len(data):
-        return []
-    out = []
-    for i in range(n_entries):
-        src, dst, cl, dl = struct.unpack_from('<4I', data, base_off + i * 16)
-        out.append({
-            'src':      _hex(src),
-            'dst':      _hex(dst),
-            'copy_len': _hex(cl),
-            'dest_len': _hex(dl),
-        })
-    return out
-
-
-def _hex(v):
-    return f"0x{v & 0xFFFFFFFF:08X}"
-
-
-def _hex16(v):
-    return f"0x{v & 0xFFFF:04X}"
+def _resolve_region(data, candidates):
+    """Return (hdr, romhdr_off, load_offset) for the first candidate whose
+    ROMHDR parses, or (None, None, None)."""
+    for romhdr_off, load_offset in candidates:
+        if 0 <= romhdr_off and romhdr_off + ROMHDR_SIZE <= len(data):
+            h = parse_romhdr(data, romhdr_off)
+            if h is not None:
+                return h, romhdr_off, load_offset
+    return None, None, None
 
 
 def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
@@ -280,8 +206,20 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
     """
     is_heuristic = (fs_mode == 'heuristic')
     skip_fs = (fs_mode == 'no')
-    ecec_limit = min(len(data), 0x800000)  # ECEC should be in first 8 MB
-    ececs = find_all_ecec(data, limit=ecec_limit)
+
+    if rom_meta is not None:
+        # Public-call robustness: callers may hand us a partial rom_meta
+        # (e.g. {'romhdr': None}). The per-region loop appends to these lists
+        # unconditionally, so seed the contract keys to avoid a KeyError.
+        for _k in ('modules', 'files', 'rompid', 'copy_table'):
+            rom_meta.setdefault(_k, [])
+
+    # Scan the whole image for ECEC markers: a multi-XIP ROM places later
+    # regions (notably the NK kernel region) in the file tail, far past any
+    # front-of-file window. The region loop below validates each ECEC by
+    # parsing its ROMHDR, so a stray 'ECEC' byte match that resolves to no
+    # header is skipped harmlessly.
+    ececs = find_all_ecec(data)
 
     if not ececs:
         # CE 2.x ROMs carry no ECEC marker. Recover the ROMHDR by
@@ -298,38 +236,30 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
         print(f"{label}  No ECEC marker — structural ROMHDR @ 0x{romhdr_off:X} (CE 2.x)")
         ececs = [(0x40, ptoc_va, romhdr_off)]
 
+    # When no ECEC resolves through the externally-supplied base candidates,
+    # the image carries no container base (a RAM-run NB0 bootloader: region VAs
+    # are ~0x900xxxxx and the file IS the region). Only then derive each
+    # region's base from its ROMHDR self-consistency. The pre-pass gate scopes
+    # the derive to images that need it, so the full-image scan never runs on a
+    # container ROM that already resolves.
+    use_derive = not any(
+        _resolve_region(data, _region_candidates(base_offset, e, p, r))[0]
+        is not None
+        for e, p, r in ececs
+    )
+
     total_mods = 0
     total_files = 0
 
     for ecec_off, ptoc_va, romhdr_off_field in ececs:
-        if romhdr_off_field:
-            # ECEC+8 holds the ROMHDR offset from physfirst.
-            xip_base = max(ecec_off - 0x40, 0)
-            romhdr_off = xip_base + romhdr_off_field
-            load_offset = ptoc_va - romhdr_off
-            candidates = [(romhdr_off, load_offset)]
-        else:
-            # ECEC+8 zero: try the explicit base_offset, the kernel-VA
-            # mirror (some B000FF images carry physical addresses in the
-            # section table while ECEC still carries the virtual VA),
-            # and high-bit masks of the value at ECEC+4.
-            candidates = [(ptoc_va - base_offset, base_offset)]
-            mirror = base_offset | 0x80000000
-            if mirror != base_offset:
-                candidates.append((ptoc_va - mirror, mirror))
-            for mask in (0xFF000000, 0xF0000000):
-                cand_load = ptoc_va & mask
-                cand_off = ptoc_va - cand_load
-                if (cand_off, cand_load) not in candidates:
-                    candidates.append((cand_off, cand_load))
-
-        hdr = None
-        for romhdr_off, load_offset in candidates:
-            if 0 <= romhdr_off and romhdr_off + ROMHDR_SIZE <= len(data):
-                h = parse_romhdr(data, romhdr_off)
-                if h is not None:
-                    hdr = h
-                    break
+        candidates = _region_candidates(base_offset, ecec_off, ptoc_va,
+                                        romhdr_off_field)
+        hdr, romhdr_off, load_offset = _resolve_region(data, candidates)
+        if hdr is None and use_derive and not romhdr_off_field:
+            derived = _derive_base_from_ptoc(data, ptoc_va)
+            if derived:
+                romhdr_off, load_offset = derived
+                hdr = parse_romhdr(data, romhdr_off)
         if hdr is None:
             continue
 
@@ -339,6 +269,9 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
 
         print(f"{label}  XIP @ 0x{ecec_off:X}: {nummods} modules, {numfiles} files "
               f"(load=0x{load_offset:08X})")
+
+        if rom_meta is not None:
+            rom_meta['_region_count'] = rom_meta.get('_region_count', 0) + 1
 
         # Populate rom_meta on the first valid ROMHDR encountered.
         if rom_meta is not None and rom_meta.get('romhdr') is None:
