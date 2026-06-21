@@ -50,7 +50,7 @@ def find_all_ecec(data, limit=None):
 
 
 def find_romhdr_structural(data):
-    """Locate the ROMHDR when there is no ECEC marker (CE 2.x ROMs — the
+    """Locate the ROMHDR when there is no ECEC marker (CE 2.x ROMs - the
     ECEC signature slot was added in CE3 romldr.h). Slide a validating
     window and confirm the TOC resolves printable module names including
     nk.exe, matching CERF rom_image_parse.cpp ResolveRomhdrStructural.
@@ -233,7 +233,7 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             print(f"{label}  No ECEC signatures found")
             return
         romhdr_off, _load_offset, ptoc_va = structural
-        print(f"{label}  No ECEC marker — structural ROMHDR @ 0x{romhdr_off:X} (CE 2.x)")
+        print(f"{label}  No ECEC marker - structural ROMHDR @ 0x{romhdr_off:X} (CE 2.x)")
         ececs = [(0x40, ptoc_va, romhdr_off)]
 
     # When no ECEC resolves through the externally-supplied base candidates,
@@ -265,7 +265,12 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
 
         nummods = hdr['nummods']
         numfiles = hdr['numfiles']
-        machine = hdr['usCPUType'] if hdr['usCPUType'] in (0x01C0, 0x01C2, 0x01C4, 0x014C) else 0x01C0
+        KNOWN_MACHINES = (
+            0x01C0, 0x01C2, 0x01C4, 0x014C,
+            0x01A2, 0x01A3, 0x01A6,
+            0x0162, 0x0166, 0x0168, 0x0169, 0x0266, 0x0366, 0x0466,
+        )
+        machine = hdr['usCPUType'] if hdr['usCPUType'] in KNOWN_MACHINES else 0x01C0
 
         print(f"{label}  XIP @ 0x{ecec_off:X}: {nummods} modules, {numfiles} files "
               f"(load=0x{load_offset:08X})")
