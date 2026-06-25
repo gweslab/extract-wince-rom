@@ -26,6 +26,11 @@ MAGIC_MODULE  = 0xFFFFFEFE
 MAGIC_FILE    = 0xFFFFF6FE
 MAGIC_NAME    = 0xFFFFFEFB
 MAGIC_SECTION = 0xFFFFF6FD
+MAGIC_MODULE_SECTION = 0xFFFFFEFD
+
+
+def _is_section(magic):
+    return magic in (MAGIC_SECTION, MAGIC_MODULE_SECTION)
 
 
 # ── FTL (Flash Translation Layer) ───────────────────────────────────────────
@@ -370,7 +375,7 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
                 if smag == MAGIC_NAME:
                     j += 1
                     continue
-                if smag != MAGIC_SECTION:
+                if not _is_section(smag):
                     break
                 sni   = sraw[0x0C:0x0C + 12]
                 ssz   = u32(sraw, 0x18)
