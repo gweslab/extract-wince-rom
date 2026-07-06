@@ -185,7 +185,7 @@ def _resolve_region(data, candidates):
 
 
 def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
-                        fs_mode='raw', rom_meta=None):
+                        fs_mode='raw', rom_meta=None, machine_override=None):
     """Find and extract all XIP regions from a flat image.
 
     data:        flat image bytes
@@ -270,7 +270,14 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             0x01A2, 0x01A3, 0x01A6,
             0x0162, 0x0166, 0x0168, 0x0169, 0x0266, 0x0366, 0x0466,
         )
-        machine = hdr['usCPUType'] if hdr['usCPUType'] in KNOWN_MACHINES else 0x01C0
+        # ROMHDR usCPUType is authoritative when populated, but CE 2.0 leaves
+        # it 0; --machine lets the caller stamp the true arch in that case.
+        if machine_override is not None:
+            machine = machine_override
+        elif hdr['usCPUType'] in KNOWN_MACHINES:
+            machine = hdr['usCPUType']
+        else:
+            machine = 0x01C0
 
         print(f"{label}  XIP @ 0x{ecec_off:X}: {nummods} modules, {numfiles} files "
               f"(load=0x{load_offset:08X})")

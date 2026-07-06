@@ -17,6 +17,12 @@ Exactly one input file (relative or absolute path).
             Output directory. Default: <dir-of-input>/<basename>/
             e.g. C:\\data\\img.bin -> C:\\data\\img\\
 
+--machine ARCH
+            Force the output PE machine type. Needed when the ROMHDR
+            usCPUType is 0 (CE 2.0 leaves it unpopulated); otherwise the
+            ROMHDR value is used. One of: arm, thumb, armv7, mips, mips16,
+            mipsfpu, sh3, sh4, x86.
+
 --fs=MODE controls filesystem reconstruction (default: --fs=raw):
 
   raw        Each module emits a PE-spec valid PE under
@@ -62,11 +68,21 @@ Exactly one input file (relative or absolute path).
 """
 
 
+# PE machine values for the --machine override, used when the ROMHDR
+# usCPUType is 0/unknown (CE 2.0 leaves it unpopulated).
+_MACHINE_NAMES = {
+    'arm': 0x01C0, 'thumb': 0x01C2, 'armv7': 0x01C4,
+    'mips': 0x0166, 'mips16': 0x0266, 'mipsfpu': 0x0366,
+    'sh3': 0x01A2, 'sh4': 0x01A6, 'x86': 0x014C,
+}
+
+
 def main():
     args = sys.argv[1:]
     fs_mode = 'raw'
     sections_mode = 'non-module'
     out_dir = None
+    machine_override = None
     positional = []
     i = 0
     while i < len(args):
@@ -85,6 +101,20 @@ def main():
                 print(f"ERROR: invalid --sections value: {v!r}. Use full, non-module, or no.")
                 return 1
             sections_mode = v
+        elif a.startswith('--machine='):
+            v = a.split('=', 1)[1].lower()
+            if v not in _MACHINE_NAMES:
+                print(f"ERROR: invalid --machine value: {v!r}. Use one of: "
+                      f"{', '.join(sorted(_MACHINE_NAMES))}.")
+                return 1
+            machine_override = _MACHINE_NAMES[v]
+        elif a == '--machine':
+            i += 1
+            if i >= len(args) or args[i].lower() not in _MACHINE_NAMES:
+                print(f"ERROR: --machine requires one of: "
+                      f"{', '.join(sorted(_MACHINE_NAMES))}.")
+                return 1
+            machine_override = _MACHINE_NAMES[args[i].lower()]
         elif a.startswith('--output-dir='):
             out_dir = a.split('=', 1)[1]
         elif a in ('-o', '--output-dir'):
@@ -122,7 +152,7 @@ def main():
         print("         --fs=raw if that's not intended.")
 
     extract_image(bin_path, fs_mode=fs_mode, sections_mode=sections_mode,
-                  out_dir=out_dir)
+                  out_dir=out_dir, machine_override=machine_override)
 
 
 if __name__ == '__main__':

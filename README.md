@@ -2,10 +2,10 @@
 
 Decomposes Windows CE ROM images (.BIN, .nb0) into smallest chunks: PE executables, media, registry, directory structure, and a `rom_meta.json` describing the ROMHDR / TOC / FILES / ROMPID metadata.
 
-Targets Microsoft Device Emulator images and OEM dumps from Windows CE 2.11 (Handheld PC Professional) through Windows Phone 7, including Zune OS (CE 5.0 / CE 6.0) firmware.
+Targets Microsoft Device Emulator images and OEM dumps from Windows CE 2.0 (Handheld PC) through Windows Phone 7, including Zune OS (CE 5.0 / CE 6.0) firmware. PE reconstruction is CPU-agnostic (machine taken from the ROMHDR, or `--machine` when it is unpopulated); tested on ARM, x86, and MIPS ROMs.
 
 > [!WARNING]
-> **`.reloc` synthesis is inherently approximate** and is **off by default**. It runs only under `--fs=heuristic`. The ROM builder strips the original base-relocation directory, so there is no ground truth — synth entries are reconstructed by scanning section bytes for 4-byte values that fall within the module's image range. ARM instruction encodings, resource sentinels, and coincidental in-range values all collide with real pointers; expect false positives that corrupt embedded constants when consumers re-relocate the PE. Default (`--fs=raw`) skips synth entirely and sets `IMAGE_FILE_RELOCS_STRIPPED` so loaders fail loud rather than apply a faulty table.
+> **`.reloc` synthesis is inherently approximate** and is **off by default**. It runs only under `--fs=heuristic`. The ROM builder strips the original base-relocation directory, so there is no ground truth - synth entries are reconstructed by scanning section bytes for 4-byte values that fall within the module's image range. ARM instruction encodings, resource sentinels, and coincidental in-range values all collide with real pointers; expect false positives that corrupt embedded constants when consumers re-relocate the PE. Default (`--fs=raw`) skips synth entirely and sets `IMAGE_FILE_RELOCS_STRIPPED` so loaders fail loud rather than apply a faulty table.
 >
 > Other stages (B000FF/NB0 parsing, XIP PE reconstruction, LZX/XPRESS decompression, IMGFS walk, RGU→REG conversion) are documented format parsing and should be correct in principle, but **have not been independently verified** against a reference implementation. Treat all output as best-effort.
 
@@ -13,7 +13,7 @@ Targets Microsoft Device Emulator images and OEM dumps from Windows CE 2.11 (Han
 
 - **B000FF** (sectioned container) and **NB0** (flat binary) ROM formats
 - **XIP modules** with LZX (CE 4+) and CE3 BIN (CE 2.x / Pocket PC 2000) decompression, and PE32 reconstruction from `e32_rom`/`o32_rom` headers
-- **CE 2.x ROMs** (Handheld PC Professional, CE 2.11) — these predate the `ECEC` ROM signature (added in CE3), so the ROMHDR is located by a structural scan validated against the module TOC (`nk.exe` present). Their `e32_rom` also differs: `e32_subsys` sits at offset `0x18` with the data-directory array at `0x1C` and no `e32_sect14` field, where CE3+ moved the subsystem field after the directories and added `sect14`. Both layouts are detected automatically.
+- **CE 2.x ROMs** (Handheld PC, CE 2.0 / 2.11) - these predate the `ECEC` ROM signature (added in CE3), so the ROMHDR is located by a structural scan validated against the module TOC (`nk.exe` present). Their `e32_rom` also differs by version: CE 2.11 has no `e32_sect14` field, with `e32_subsys` at offset `0x18` and the data-directory array at `0x1C`; CE 2.0 additionally lacks `e32_vsize`, so `e32_subsys` sits at `0x14`, the directory array at `0x18`, and the image size is derived from the `o32_rom` section records. CE3+ moved the subsystem field after the directories and added `sect14`. All layouts are detected automatically. CE 2.0 also leaves `ROMHDR.usCPUType` = 0, so `--machine` must name the CPU (see Usage).
 - **IMGFS filesystem** extraction with Flash Translation Layer page mapping and XPRESS decompression
 - **Every module emits a PE-spec valid container with an appended `.cerom` section** carrying the per-module CE metadata PE format can't natively encode. See [The `.cerom` section](#the-cerom-section) for the format spec.
 - **Relocation fixup** for XIP PEs (heuristic mode only): patches split-address references (`o32_realaddr`) and synthesizes `.reloc` sections by scanning for absolute references
@@ -30,7 +30,7 @@ Every PE under `fs/Windows/` ships an appended `.cerom` section carrying per-mod
 
 Two kinds of per-module data:
 
-1. **TOCentry block** (always present). The 32-byte `TOCentry` struct fields the kernel reads when walking the ROM's table of contents at boot — `e32_offset`, `o32_offset`, `name_offset`, `load_va`, `file_size`, `attributes`, `filetime`, plus the original `e32_rom.vsize`. Consumers reach this without going through `Sections/`.
+1. **TOCentry block** (always present). The 32-byte `TOCentry` struct fields the kernel reads when walking the ROM's table of contents at boot - `e32_offset`, `o32_offset`, `name_offset`, `load_va`, `file_size`, `attributes`, `filetime`, plus the original `e32_rom.vsize`. Consumers reach this without going through `Sections/`.
 2. **Original `o32_rom` records + shadow section bytes** (only when needed). PE format has one `VirtualAddress` per section header and no `realaddr` field. Two CE patterns can't be encoded in a standard PE container:
     - **Shared-RVA**: two `o32_rom` records claim the same `rva` (writable RAM-mapped overlaid on read-only ROM-mapped, never live simultaneously). Romimage allows it; PE doesn't.
     - **Split-address**: `o32.realaddr ≠ vbase + o32.rva` (the kernel's MMU maps the section at a runtime VA different from its link-time slot).
@@ -129,19 +129,21 @@ The reference Python implementation lives in [`winmob_extract/pe/cerom.py`](winm
 
 - **`raw`** (default). Each module emits a single PE-spec valid PE under `<out>/fs/Windows/<name>` with bytes verbatim from ROM at original link-time RVAs, plus a `.cerom` section ([format above](#the-cerom-section)) carrying CE metadata.
 - **`heuristic`**. `raw` + synthesize `.reloc` + un-rebase DLLs to `ImageBase=0x10000000` + IAT bound→unbound. The `.reloc` synth has structural false positives (ARM literal pools, resource sentinels, coincidental in-range constants collide with real pointers); not recommended for production.
-- **`no`**. Skip filesystem reconstruction entirely. Output is `rom_meta.json` + `Sections/` only — no `fs/`, no `Registry/`, no `attributes.ini`.
+- **`no`**. Skip filesystem reconstruction entirely. Output is `rom_meta.json` + `Sections/` only - no `fs/`, no `Registry/`, no `attributes.ini`.
 
 `--sections=MODE` controls the `Sections/` folder:
 
-- **`non-module`** (default). Emit only what's *not* in any module's PE — bootloaders, ROMHDR / TOC / FILESentry / COPYentry / ROMPID kernel structures, the IMGFS region (when present), strings, padding. Each per-module byte range is already reachable through that module's PE in `fs/Windows/`, so this folder excludes them.
+- **`non-module`** (default). Emit only what's *not* in any module's PE - bootloaders, ROMHDR / TOC / FILESentry / COPYentry / ROMPID kernel structures, the IMGFS region (when present), strings, padding. Each per-module byte range is already reachable through that module's PE in `fs/Windows/`, so this folder excludes them.
 - **`full`**. B000FF: one file per ROM section (native layout). NB0: one file with the entire flat kernel-VA image. Suitable for full reverse engineering or recovering bootloaders / boot images that have no ECEC marker.
 - **`no`**. Skip the `Sections/` folder entirely.
 
 ## Usage
 
 ```
-python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [-o PATH] <image.BIN|.nb0>
+python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [--machine=ARCH] [-o PATH] <image.BIN|.nb0>
 ```
+
+`--machine=ARCH` forces the output PE machine type (`arm`, `thumb`, `armv7`, `mips`, `mips16`, `mipsfpu`, `sh3`, `sh4`, `x86`). Needed only when the ROMHDR `usCPUType` is 0 (CE 2.0 leaves it unpopulated); otherwise the ROMHDR value is authoritative.
 
 `-o PATH` / `--output-dir=PATH` overrides the output directory. Default:
 `<dir-of-input>/<basename>/` (e.g. `C:\data\img.bin` → `C:\data\img\`):
@@ -175,6 +177,7 @@ python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [-o PATH] <image.BIN|.
 
 | Image(s) | OS | Arch | Device | Format |
 |----------|----|------|--------|--------|
+| `mp700_rom.bin` | Handheld PC (CE 2.0) | MIPS | NEC MobilePro 700 (NEC VR4102) | NB0 (flat XIP, no `ECEC`) |
 | `jornada820.bin` | Handheld PC Professional (CE 2.11) | ARM | HP Jornada 820 (StrongARM SA-1100) | NB0 (flat XIP, no `ECEC`) |
 | `jornada720.bin` | Handheld PC 2000 (CE 3.0) | ARM | HP Jornada 720 (StrongARM SA-1110) | NB0 (flat XIP) |
 | `IPAQROM177.nb0` | Pocket PC 2000 | ARM | Compaq iPAQ 3600/3650 | NB0 |

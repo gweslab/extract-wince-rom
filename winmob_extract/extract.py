@@ -378,7 +378,8 @@ def _emit_sections(out_dir, sections_mode, rom_meta, fmt, *,
 
 # ── Main pipeline ───────────────────────────────────────────────────────────
 
-def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=None):
+def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=None,
+                  machine_override=None):
     """Extract a Windows CE / Windows Mobile ROM image.
 
     fs_mode controls filesystem reconstruction:
@@ -439,7 +440,8 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=N
 
         print("\nExtracting XIP regions...")
         extract_xip_regions(flat, base_va, out_dir, attr_log=attr_log,
-                            fs_mode=fs_mode, rom_meta=rom_meta)
+                            fs_mode=fs_mode, rom_meta=rom_meta,
+                            machine_override=machine_override)
 
         print(f"\nWriting Sections/ ({sections_mode})...")
         _emit_sections(out_dir, sections_mode, rom_meta, fmt='b000ff',
@@ -456,7 +458,8 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=N
 
         print("\nExtracting XIP regions...")
         extract_xip_regions(data, 0, out_dir, attr_log=attr_log,
-                            fs_mode=fs_mode, rom_meta=rom_meta)
+                            fs_mode=fs_mode, rom_meta=rom_meta,
+                            machine_override=machine_override)
 
         if has_imgfs:
             print("\nExtracting IMGFS filesystem...")
