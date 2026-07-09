@@ -203,14 +203,6 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     ]
     primary_indices = pick_primary_indices(o32_records)
 
-    # CE 2.0's e32_rom has no e32_vsize field; derive SizeOfImage from the
-    # o32_rom records (the highest rva+vsize, page-aligned).
-    if info.get('is_ce20') and not info['vsize']:
-        end = 0
-        for sv, sr, sp, sd, sa, sf in o32_records:
-            end = max(end, sr + sv)
-        info['vsize'] = align(end, 0x1000)
-
     # Decide whether this module needs `.cerom` at all. PE format can
     # encode every CE module that has unique rvas AND no split-address
     # sections (realaddr == 0 or realaddr == vbase+rva for every o32);

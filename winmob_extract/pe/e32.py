@@ -18,14 +18,7 @@ E32_DD_OFF_LEGACY = 0x20
 E32_DD_OFF_WM5    = 0x24  # name kept for back-compat; actual layout = "extended"
 E32_DD_OFF_CE2    = 0x1C  # CE 2.11: e32_vsize at 0x14, e32_subsys (u16) at 0x18,
                           # DD array at 0x1C, no e32_sect14 field (added in CE3).
-E32_DD_OFF_CE20   = 0x18  # CE 2.0: e32_rom has no e32_vsize field (added in
-                          # CE 2.11). e32_subsys (u16) occupies 0x14 and the DD
-                          # array follows at 0x18; vsize is derived from the
-                          # o32_rom records by the caller. Grounded in the
-                          # CE 2.11 romldr.h e32_rom struct (which lists
-                          # e32_vsize as a distinct field) plus cross-module
-                          # validation of a MIPS CE 2.0 ROM (coredll's DD[0]
-                          # export directory lands at 0x18).
+E32_DD_OFF_CE20   = 0x18  # CE 2.0: no e32_stackmax; e32_vsize@0x10, e32_subsys(u16)@0x14, DD@0x18.
 O32_SIZE = 24             # sizeof(o32_rom)
 
 
@@ -42,10 +35,8 @@ def parse_e32_base(data, off, dd_offset):
     stackmax  = u32(data, off + 0x10)
 
     if dd_offset == E32_DD_OFF_CE20:
-        # CE 2.0: no e32_vsize field. e32_subsys (u16) is at 0x14, the DD
-        # array at 0x18, no e32_sect14 field or timestamp. vsize is left 0
-        # here as a sentinel; the caller derives it from the o32_rom records.
-        vsize = 0
+        vsize = u32(data, off + 0x10)
+        stackmax = 0
         subsys = u16(data, off + 0x14)
         sect14_rva = 0
         sect14_size = 0
@@ -99,15 +90,9 @@ def _layout_valid(info):
     if info['subsystem'] not in ok_subsys:
         return False
     vsize = info['vsize']
-    if info.get('is_ce20'):
-        # CE 2.0 has no e32_vsize; it is derived from o32 later. The DD RVAs
-        # are bounded loosely here (subsystem validity above is the layout
-        # discriminator vs. the CE 2.11 / legacy / extended candidates).
-        bound = 0x10000000
-    else:
-        if vsize == 0 or vsize > 0x10000000:
-            return False
-        bound = vsize
+    if vsize == 0 or vsize > 0x10000000:
+        return False
+    bound = vsize
     for rva, sz in info['ce_dds']:
         if rva and rva >= bound:
             return False
