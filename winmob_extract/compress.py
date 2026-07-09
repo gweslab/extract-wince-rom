@@ -246,3 +246,81 @@ def try_decompress(chunk, full_size):
     if len(result) == full_size:
         return result
     return None
+
+
+def ce1_lzw_decompress(src, out_size):
+    CLEAR = 256
+    width = 9
+    mask = 511
+    next_code = 257
+    prefix = {}
+    suffix = {}
+    bitbuf = 0
+    bitcnt = 0
+    pos = 0
+    n = len(src)
+
+    def read_code():
+        nonlocal bitbuf, bitcnt, pos
+        while bitcnt < width:
+            if pos >= n:
+                return None
+            bitbuf |= src[pos] << bitcnt
+            bitcnt += 8
+            pos += 1
+        code = bitbuf & mask
+        bitbuf >>= width
+        bitcnt -= width
+        return code
+
+    out = bytearray()
+
+    def emit(code):
+        stack = []
+        while code >= 257:
+            stack.append(suffix[code])
+            code = prefix[code]
+        stack.append(code)
+        stack.reverse()
+        out.extend(stack)
+        return stack[0]
+
+    prev = None
+    while len(out) < out_size:
+        code = read_code()
+        if code is None:
+            break
+        if code == CLEAR:
+            width, mask, next_code, prev = 9, 511, 257, None
+            continue
+        if prev is None:
+            emit(code)
+            prev = code
+            continue
+        if code < next_code:
+            first = emit(code)
+        else:
+            fb = prev
+            while fb >= 257:
+                fb = prefix[fb]
+            stack = []
+            c = prev
+            while c >= 257:
+                stack.append(suffix[c])
+                c = prefix[c]
+            stack.append(c)
+            stack.reverse()
+            out.extend(stack)
+            out.append(fb)
+            first = stack[0]
+        if next_code < 4096:
+            prefix[next_code] = prev
+            suffix[next_code] = first
+            old = next_code
+            next_code += 1
+            if old == mask and mask < 0xFFF:
+                mask += next_code
+                width += 1
+        prev = code
+
+    return bytes(out[:out_size])

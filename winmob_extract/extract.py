@@ -13,6 +13,7 @@ import shutil
 
 from .util import u32
 from .b000ff import parse_b000ff
+from .ce1 import is_ce1_rom, extract_ce1
 from .xip import extract_xip_regions
 from .imgfs import IMGFS_UUID, find_imgfs_base, extract_imgfs
 from .registry import CE_FDF_MAGIC, parse_fdf_registry, fdf_to_reg_text
@@ -446,6 +447,16 @@ def extract_image(bin_path, fs_mode='raw', sections_mode='non-module', out_dir=N
         print(f"\nWriting Sections/ ({sections_mode})...")
         _emit_sections(out_dir, sections_mode, rom_meta, fmt='b000ff',
                        b000ff_data=data, b000ff_records=records)
+    elif is_ce1_rom(data):
+        print("\nFormat: Windows CE 1.0 XIP")
+        print("\nExtracting XIP regions...")
+        extract_ce1(data, out_dir, attr_log=attr_log, fs_mode=fs_mode,
+                    rom_meta=rom_meta)
+        load_offset = rom_meta.get('_load_offset')
+        if load_offset is not None:
+            print(f"\nWriting Sections/ ({sections_mode})...")
+            _emit_sections(out_dir, sections_mode, rom_meta, fmt='nb0',
+                           nb0_data=data, nb0_load_offset=load_offset)
     else:
         # NB0 flat image (WM6+). Verify ARM branch at offset 0.
         sig = u32(data, 0)
