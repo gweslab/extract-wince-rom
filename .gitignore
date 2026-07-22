@@ -3,6 +3,7 @@
 !.gitmodules
 !extract_wince_rom.py
 !postprocess_sysgen.py
+!casio_be_unpack.py
 !README.md
 !wince_decompr
 !winmob_extract
