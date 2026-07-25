@@ -235,9 +235,13 @@ def find_imgfs_base(data):
         pos = idx + 1
 
 
-def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None):
+def extract_imgfs(data, output_dir, machine, attr_log=None, fs_mode='raw',
+                  rom_meta=None):
     """Locate and extract all files from the IMGFS filesystem.
     Handles both FTL-mapped and direct-addressed (NOR) images.
+
+    machine:  IMAGE_FILE_MACHINE value stamped into every emitted PE.
+              IMGFS dirents carry no CPU field.
 
     attr_log: optional dict; if provided, records the original CE file
               attribute bits and FILETIME for every emitted file/module as
@@ -399,7 +403,8 @@ def extract_imgfs(data, output_dir, attr_log=None, fs_mode='raw', rom_meta=None)
                     'filetime_hi': (ft >> 32) & 0xFFFFFFFF,
                 }
                 pe = reconstruct_pe_imgfs(
-                    header, sec_data, heuristic=is_heuristic, toc_dict=toc_dict)
+                    header, sec_data, machine, heuristic=is_heuristic,
+                    toc_dict=toc_dict)
                 if pe:
                     if not skip_fs:
                         path = os.path.join(win_dir, safe_filename(name))

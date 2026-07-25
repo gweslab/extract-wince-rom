@@ -154,7 +154,7 @@ def _append_cerom_section(sections, cerom_blob):
     ))
 
 
-def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
+def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine,
                        dd_offset=None, heuristic=False, toc_dict=None):
     """Build PE from XIP module (separate e32/o32 pointers in flat image).
 
@@ -292,8 +292,8 @@ def reconstruct_pe_xip(flat, base_off, e32_va, o32_va, machine=0x01C0,
     return pe_data
 
 
-def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False,
-                         toc_dict=None):
+def reconstruct_pe_imgfs(header_data, section_data_map, machine,
+                         heuristic=False, toc_dict=None):
     """Build PE from IMGFS module (combined e32rom+o32_rom header blob).
 
     Same `.cerom`-based shared-RVA handling as reconstruct_pe_xip: the
@@ -370,7 +370,7 @@ def reconstruct_pe_imgfs(header_data, section_data_map, heuristic=False,
     pe_data = build_pe(len(sections), imgflags, info['entry_rva'], info['vbase'],
                        info['sub_maj'], info['sub_min'], info['stackmax'],
                        info['vsize'], info['timestamp'], ce_dds,
-                       sections, subsystem=info.get('subsystem', 9),
+                       sections, machine, subsystem=info.get('subsystem', 9),
                        sect14_rva=info.get('sect14_rva', 0),
                        sect14_size=info.get('sect14_size', 0))
     if not pe_data:

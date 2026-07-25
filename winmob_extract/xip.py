@@ -13,6 +13,7 @@ import struct
 from .util import (u32, read_ascii, safe_filename,
                    ROMHDR_SIZE, TOCENTRY_SIZE, FILEENTRY_SIZE)
 from .compress import ce_rom_decompress
+from .machine import resolve_machine
 from .pe import reconstruct_pe_xip
 from .rom_structs import (_hex, _hex16, parse_rompid_chain,
                           parse_e32_header, parse_section_records,
@@ -184,6 +185,72 @@ def _resolve_region(data, candidates):
     return None, None, None
 
 
+def _region_headers(data, base_offset):
+    """Resolve every XIP region in a flat image, writing nothing.
+
+    Returns (regions, structural_off):
+      regions:        [(ecec_off, ptoc_va, romhdr_off_field, hdr,
+                      romhdr_off, load_offset)], or None when the image
+                      carries neither an ECEC marker nor a structurally
+                      recoverable ROMHDR.
+      structural_off: ROMHDR offset when it came from the structural scan.
+    """
+    # Scan the whole image for ECEC markers: a multi-XIP ROM places later
+    # regions (notably the NK kernel region) in the file tail, far past any
+    # front-of-file window. Each ECEC is validated by parsing its ROMHDR, so
+    # a stray 'ECEC' byte match that resolves to no header is skipped
+    # harmlessly.
+    ececs = find_all_ecec(data)
+    structural_off = None
+
+    if not ececs:
+        # CE 2.x ROMs carry no ECEC marker. Recover the ROMHDR by
+        # structural scan, then synthesize the (ecec_off, ptoc_va,
+        # romhdr_off_field) triple the loop below consumes: ecec_off=0x40
+        # makes xip_base=0 so romhdr_off_field == romhdr_off, and
+        # ptoc_va == load_offset+romhdr_off makes load_offset resolve back
+        # to physfirst.
+        structural = find_romhdr_structural(data)
+        if structural is None:
+            return None, None
+        structural_off, _load_offset, ptoc_va = structural
+        ececs = [(0x40, ptoc_va, structural_off)]
+
+    # When no ECEC resolves through the externally-supplied base candidates,
+    # the image carries no container base (a RAM-run NB0 bootloader: region VAs
+    # are ~0x900xxxxx and the file IS the region). Only then derive each
+    # region's base from its ROMHDR self-consistency. The pre-pass gate scopes
+    # the derive to images that need it, so the full-image scan never runs on a
+    # container ROM that already resolves.
+    use_derive = not any(
+        _resolve_region(data, _region_candidates(base_offset, e, p, r))[0]
+        is not None
+        for e, p, r in ececs
+    )
+
+    regions = []
+    for ecec_off, ptoc_va, romhdr_off_field in ececs:
+        candidates = _region_candidates(base_offset, ecec_off, ptoc_va,
+                                        romhdr_off_field)
+        hdr, romhdr_off, load_offset = _resolve_region(data, candidates)
+        if hdr is None and use_derive and not romhdr_off_field:
+            derived = _derive_base_from_ptoc(data, ptoc_va)
+            if derived:
+                romhdr_off, load_offset = derived
+                hdr = parse_romhdr(data, romhdr_off)
+        if hdr is None:
+            continue
+        regions.append((ecec_off, ptoc_va, romhdr_off_field, hdr,
+                        romhdr_off, load_offset))
+    return regions, structural_off
+
+
+def probe_cpu_types(data, base_offset):
+    """usCPUType of every resolvable XIP region, writing nothing."""
+    regions, _ = _region_headers(data, base_offset)
+    return [r[3]['usCPUType'] for r in regions or []]
+
+
 def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
                         fs_mode='raw', rom_meta=None, machine_override=None):
     """Find and extract all XIP regions from a flat image.
@@ -214,70 +281,22 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
         for _k in ('modules', 'files', 'rompid', 'copy_table'):
             rom_meta.setdefault(_k, [])
 
-    # Scan the whole image for ECEC markers: a multi-XIP ROM places later
-    # regions (notably the NK kernel region) in the file tail, far past any
-    # front-of-file window. The region loop below validates each ECEC by
-    # parsing its ROMHDR, so a stray 'ECEC' byte match that resolves to no
-    # header is skipped harmlessly.
-    ececs = find_all_ecec(data)
-
-    if not ececs:
-        # CE 2.x ROMs carry no ECEC marker. Recover the ROMHDR by
-        # structural scan, then synthesize the (ecec_off, ptoc_va,
-        # romhdr_off_field) triple the loop below consumes: ecec_off=0x40
-        # makes xip_base=0 so romhdr_off_field == romhdr_off, and
-        # ptoc_va == load_offset+romhdr_off makes load_offset resolve back
-        # to physfirst.
-        structural = find_romhdr_structural(data)
-        if structural is None:
-            print(f"{label}  No ECEC signatures found")
-            return
-        romhdr_off, _load_offset, ptoc_va = structural
-        print(f"{label}  No ECEC marker - structural ROMHDR @ 0x{romhdr_off:X} (CE 2.x)")
-        ececs = [(0x40, ptoc_va, romhdr_off)]
-
-    # When no ECEC resolves through the externally-supplied base candidates,
-    # the image carries no container base (a RAM-run NB0 bootloader: region VAs
-    # are ~0x900xxxxx and the file IS the region). Only then derive each
-    # region's base from its ROMHDR self-consistency. The pre-pass gate scopes
-    # the derive to images that need it, so the full-image scan never runs on a
-    # container ROM that already resolves.
-    use_derive = not any(
-        _resolve_region(data, _region_candidates(base_offset, e, p, r))[0]
-        is not None
-        for e, p, r in ececs
-    )
+    regions, structural_off = _region_headers(data, base_offset)
+    if regions is None:
+        print(f"{label}  No ECEC signatures found")
+        return
+    if structural_off is not None:
+        print(f"{label}  No ECEC marker - structural ROMHDR @ "
+              f"0x{structural_off:X} (CE 2.x)")
 
     total_mods = 0
     total_files = 0
 
-    for ecec_off, ptoc_va, romhdr_off_field in ececs:
-        candidates = _region_candidates(base_offset, ecec_off, ptoc_va,
-                                        romhdr_off_field)
-        hdr, romhdr_off, load_offset = _resolve_region(data, candidates)
-        if hdr is None and use_derive and not romhdr_off_field:
-            derived = _derive_base_from_ptoc(data, ptoc_va)
-            if derived:
-                romhdr_off, load_offset = derived
-                hdr = parse_romhdr(data, romhdr_off)
-        if hdr is None:
-            continue
-
+    for (ecec_off, ptoc_va, romhdr_off_field,
+         hdr, romhdr_off, load_offset) in regions:
         nummods = hdr['nummods']
         numfiles = hdr['numfiles']
-        KNOWN_MACHINES = (
-            0x01C0, 0x01C2, 0x01C4, 0x014C,
-            0x01A2, 0x01A3, 0x01A6,
-            0x0162, 0x0166, 0x0168, 0x0169, 0x0266, 0x0366, 0x0466,
-        )
-        # ROMHDR usCPUType is authoritative when populated, but CE 2.0 leaves
-        # it 0; --machine lets the caller stamp the true arch in that case.
-        if machine_override is not None:
-            machine = machine_override
-        elif hdr['usCPUType'] in KNOWN_MACHINES:
-            machine = hdr['usCPUType']
-        else:
-            machine = 0x01C0
+        machine = resolve_machine(hdr['usCPUType'], machine_override)
 
         print(f"{label}  XIP @ 0x{ecec_off:X}: {nummods} modules, {numfiles} files "
               f"(load=0x{load_offset:08X})")
@@ -312,6 +331,7 @@ def extract_xip_regions(data, base_offset, output_dir, label="", attr_log=None,
             rom_meta['copy_table'] = parse_copy_table(
                 data, load_offset, hdr['ulCopyOffset'], hdr['ulCopyEntries'])
             rom_meta['_romhdr_va_raw'] = ptoc_va
+            rom_meta['_cpu_type'] = hdr['usCPUType']
             rom_meta['_romhdr_off'] = romhdr_off_field
             rom_meta['_load_offset'] = load_offset
 

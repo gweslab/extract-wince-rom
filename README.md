@@ -143,7 +143,7 @@ The reference Python implementation lives in [`winmob_extract/pe/cerom.py`](winm
 python extract_wince_rom.py [--fs=MODE] [--sections=MODE] [--machine=ARCH] [-o PATH] <image.BIN|.nb0>
 ```
 
-`--machine=ARCH` forces the output PE machine type (`arm`, `thumb`, `armv7`, `mips`, `mips16`, `mipsfpu`, `sh3`, `sh4`, `x86`). Needed only when the ROMHDR `usCPUType` is 0 (CE 2.0 leaves it unpopulated); otherwise the ROMHDR value is authoritative.
+`--machine=ARCH` sets the output PE machine type (`arm`, `thumb`, `armv7`, `mips`, `mips16`, `mipsfpu`, `sh3`, `sh4`, `x86`). The ROMHDR `usCPUType` is authoritative when populated; when it is 0 `--machine` is required and extraction errors out without it.
 
 `-o PATH` / `--output-dir=PATH` overrides the output directory. Default:
 `<dir-of-input>/<basename>/` (e.g. `C:\data\img.bin` → `C:\data\img\`):

@@ -41,7 +41,7 @@ def section_name(flags, rva, ce_dds, vsize=None):
 
 
 def build_pe(objcnt, imgflags, entry_rva, vbase, subsys_maj, subsys_min,
-             stackmax, vsize, timestamp, ce_dds, sections, machine=0x01C0,
+             stackmax, vsize, timestamp, ce_dds, sections, machine,
              subsystem=9, sect14_rva=0, sect14_size=0):
     """Assemble a PE32 file from parsed e32rom fields and raw section data.
 
