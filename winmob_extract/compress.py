@@ -175,15 +175,10 @@ def _ce3_bin_decompress_block(src, dst_max):
     return bytes(out[:di])
 
 
-def ce3_bin_decompress(src, out_size, block_bits=12):
-    """Decompress a CE3 / Pocket PC 2000 BIN-compressed payload.
+CE3_BIN_BLOCK_BITS = (12, 11, 10)
 
-    Returns the decompressed bytes (zero-padded to out_size) or None if the
-    input doesn't look like a valid CE3 multi-block stream. Outer wrapper:
-    3-byte little-endian uncompressed-size header, then num_blocks-1 more
-    3-byte block-end offsets, then concatenated independent blocks of up to
-    (1 << block_bits) bytes each.
-    """
+
+def _ce3_bin_blocks(src, block_bits, strict):
     if len(src) < 3:
         return None
     uncomp_size = src[0] | (src[1] << 8) | (src[2] << 16)
@@ -198,10 +193,26 @@ def ce3_bin_decompress(src, out_size, block_bits=12):
         if end > len(src) or end < prev_end:
             return None
         block_data = src[prev_end:end]
-        remaining = uncomp_size - len(out)
-        block_out = _ce3_bin_decompress_block(block_data, min(remaining, block_size))
+        want = min(uncomp_size - len(out), block_size)
+        block_out = _ce3_bin_decompress_block(block_data, want)
+        if strict and len(block_out) != want:
+            return None
         out.extend(block_out)
         prev_end = end
+    if strict and (prev_end != len(src) or len(out) != uncomp_size):
+        return None
+    return out
+
+
+def ce3_bin_decompress(src, out_size):
+    for block_bits in CE3_BIN_BLOCK_BITS:
+        out = _ce3_bin_blocks(src, block_bits, strict=True)
+        if out is not None:
+            break
+    else:
+        out = _ce3_bin_blocks(src, CE3_BIN_BLOCK_BITS[0], strict=False)
+        if out is None:
+            return None
     if len(out) < out_size:
         out.extend(b'\x00' * (out_size - len(out)))
     return bytes(out[:out_size])
