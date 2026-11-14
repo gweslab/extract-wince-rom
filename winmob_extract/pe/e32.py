@@ -70,7 +70,7 @@ def parse_e32_base(data, off, dd_offset):
                 vbase=vbase, sub_maj=sub_maj, sub_min=sub_min,
                 stackmax=stackmax, vsize=vsize, timestamp=ts, ce_dds=ce_dds,
                 subsystem=subsys, sect14_rva=sect14_rva, sect14_size=sect14_size,
-                is_ce20=(dd_offset == E32_DD_OFF_CE20))
+                is_ce20=(dd_offset == E32_DD_OFF_CE20), is_ce2=(dd_offset == E32_DD_OFF_CE2))
 
 
 def _layout_valid(info):
@@ -82,11 +82,11 @@ def _layout_valid(info):
         return False
     # Standard IMAGE_SUBSYSTEM values seen in CE modules; used as a
     # layout discriminator (a wrong dd_offset lands "subsystem" on garbage).
-    # CE 2.0 additionally admits 4: the separately-built MFC/OLE-for-CE
-    # component DLLs stamp a nonstandard e32_subsys=4 (their subsysmajor is
-    # likewise 4, tracking MFC's version, not the OS's). Safe to admit only
-    # here because the DD page-alignment score is the real CE2.0 discriminator.
-    ok_subsys = (1, 2, 3, 4, 7, 9, 10, 11) if info.get('is_ce20') else (1, 2, 3, 7, 9, 10, 11)
+    # CE 2.0 and CE 2.11 additionally admit 4: separately built components
+    # stamp a nonstandard e32_subsys=4 (their subsysmajor is likewise 4).
+    # The other layouts read sect14_rva or a data directory at that offset.
+    ce2x = info.get('is_ce20') or info.get('is_ce2')
+    ok_subsys = (1, 2, 3, 4, 7, 9, 10, 11) if ce2x else (1, 2, 3, 7, 9, 10, 11)
     if info['subsystem'] not in ok_subsys:
         return False
     vsize = info['vsize']
